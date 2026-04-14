@@ -1,0 +1,2596 @@
+// © 2026 RTD Trading
+// =============================================================================
+// RTD IFVG - Advanced SMC & Liquidity Suite
+// Author: RTD Trading
+// 
+// ALL RIGHTS RESERVED. 
+// This code is proprietary and confidential. No part of this script may be 
+// copied, modified, distributed, published or sold without explicit written 
+// permission from RTD Trading.
+//
+// DISCLAIMER: 
+// This indicator is for educational and informational purposes only. It does 
+// NOT constitute financial advice. Trading financial markets involves high risk, 
+// including the possible loss of principal. Past performance is not indicative 
+// of future results. You are solely responsible for your own trading decisions.
+// =============================================================================
+
+//@version=6
+indicator("RTD IFVG", shorttitle="RTD IFVG", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500, max_bars_back=2500)
+
+// =============================================================================
+// --- 1. GENERAL SETTINGS ---
+// =============================================================================
+grp_gen = "GENERAL SETTINGS"
+
+detect_mode = input.string("Series", "Detection Mode", options=["Single", "Series"], tooltip="Series = Merges overlapping FVGs into one block. \nSeries = Displays each FVG individually." ,group=grp_gen, display=display.none)
+sens_mode   = input.string("Sensitive", "Sensitivity", options=["Strict", "Normal", "Sensitive"], group=grp_gen, display=display.none)
+
+len_piv = 5
+if sens_mode == "Strict"
+    len_piv := 10
+else if sens_mode == "Sensitive"
+    len_piv := 3
+
+bias_input  = input.string("Neutro", "Bias", options=["Neutro", "Bullish", "Bearish"], group=grp_gen, display=display.none)
+show_bull   = bias_input != "Bearish"
+show_bear   = bias_input != "Bullish"
+
+allow_15_ifvg = input.bool(true, "Allow 7-15 Candle IFVGs", tooltip="If enabled, IFVGS may form within 15 candles.\nIf disabled, they must form within 6 candles.", group=grp_gen, display=display.none)
+
+rm_losing   = input.bool(true, "Remove Losing Setups", tooltip="Removes trades that hit Original SL or are Scratched at Break-Even.", group=grp_gen, display=display.none)
+// --- NUEVO: Botón para invalidar setups si se toca el BE prematuramente ---
+req_be_safe = input.bool(true, "Require BE not breached in inversion", tooltip="If enabled, the setup is invalidated if the entry candle sweeps the internal liquidity (BE) simultaneously.", group=grp_gen)
+// --- NUEVO: Botón para ocultar o mostrar ganadores ---
+show_winning = input.bool(true, "Show Winning Setups", tooltip="Keep setups on the chart after they hit their final Take Profit.", group=grp_gen, display=display.none)
+// --- NUEVO: FVG Current TF como Pase VIP ---
+include_curr_tf = input.bool(false, "Include Current TF in HTF PDAs", tooltip="Allows current timeframe FVGs to act as a 'VIP Pass' for entries, and prevents them from erasing higher timeframe FVGs on the chart.", group=grp_gen, display=display.none)
+// --- TRADE MANAGEMENT INPUTS ---
+use_frontrun_filter = input.bool(false, title="Enable Anti-Front-Run Filter", tooltip="Invalidates the setup if the entry candle is so massive that it instantly sweeps the first structural target (TP1/BE). Leave unchecked to catch Market Open displacements and Judas Swings.", group="Execution")
+
+min_grade   = input.string("A", "Min RTD Grade to Display", options=["A+", "A", "A-", "B+", "B", "C"], group=grp_gen, display=display.none)
+int req_g_val = 0
+if min_grade == "B"
+    req_g_val := 1
+else if min_grade == "B+"
+    req_g_val := 2
+else if min_grade == "A-"
+    req_g_val := 3
+else if min_grade == "A"
+    req_g_val := 4
+else if min_grade == "A+"
+    req_g_val := 5
+
+max_show    = input.int(5, "Number of Setups Displayed", minval=1, group=grp_gen, display=display.none)
+
+// VARIABLE GLOBAL DE TIEMPO
+int one_bar_ms = timeframe.in_seconds(timeframe.period) * 1000
+
+// =============================================================================
+// --- 1.5 RISK MANAGEMENT & POSITION SIZE ---
+// =============================================================================
+grp_risk  = "RISK MANAGEMENT"
+sl_mode   = input.string("Wick / Swing", "Stop Loss Placement", options=["Wick / Swing", "iFVG Border", "Fixed Points"], group=grp_risk, display=display.none)
+sl_fixed_pts = input.float(15.0, "Fixed SL Size (Points)", step=1.0, tooltip="Only used if 'Fixed Points' mode is selected.", group=grp_risk, display=display.none)
+sl_buffer = input.float(5.0, "Stop Loss Buffer (Points)", step=1.0, tooltip="Breathing room added to iFVG Border SL. (Not applied to Wick mode).", group=grp_risk, display=display.none)
+
+acc_bal   = input.float(50000, "Account Balance ($)", group=grp_risk, display=display.none)
+risk_pct  = input.float(1.0, "Risk per Trade (%)", step=0.1, group=grp_risk, display=display.none)
+show_qty  = input.bool(true, "Show Position Size (Contracts)", group=grp_risk, display=display.none)
+
+// =============================================================================
+// --- 1.8 VISUAL EXECUTION PLAN ---
+// =============================================================================
+grp_viz   = "VISUAL EXECUTION PLAN"
+viz_active = input.bool(true, "Enable Visual Execution Plan", tooltip="Muestra niveles de objetivos (BE, TP1, TP2) anclados a liquidez y FVGs.", group=grp_viz, display=display.none)
+
+// --- NUEVO: Botón para mostrar precios ---
+show_prices = input.bool(false, "Show Price Levels", tooltip="Muestra el precio exacto junto a las etiquetas de SL, BE y TP.", group=grp_viz, display=display.none)
+
+c_viz_sl   = input.color(color.rgb(0, 0, 0), "Stop Loss Line (SL)", group=grp_viz, display=display.none)
+c_viz_be   = input.color(color.orange, "Break-Even Trigger (BE)", group=grp_viz, display=display.none)
+c_viz_tp   = input.color(color.rgb(0, 0, 0), "Take Profit Lines (TP)", group=grp_viz, display=display.none)
+
+// =============================================================================
+// --- MASTER SESSION TIMES (KILLZONES + LIQUIDEZ) ---
+// =============================================================================
+grp_master = "SESSION TIMES"
+t_nyam   = input.session("0930-1200", "NY AM Session", group=grp_master, display=display.none)
+t_lunch  = input.session("1200-1330", "NY Lunch Session", group=grp_master, display=display.none)
+t_nypm   = input.session("1330-1600", "NY PM Session", group=grp_master, display=display.none)
+t_lon    = input.session("0200-0500", "London Session", group=grp_master, display=display.none)
+t_asia   = input.session("2000-0000", "Asia Session", group=grp_master, display=display.none)
+
+grp_kz = "KILLZONE BACKGROUNDS"
+show_bg_nyam  = input.bool(true, "Draw NY AM Box", inline="k1", group=grp_kz, display=display.none)
+c_bg_nyam     = input.color(color.new(#2962FF, 85), "", inline="k1", group=grp_kz, display=display.none)
+show_bg_lunch = input.bool(false, "Draw Lunch Box", inline="k2", group=grp_kz, display=display.none)
+c_bg_lunch    = input.color(color.new(#787b86, 85), "", inline="k2", group=grp_kz, display=display.none)
+show_bg_nypm  = input.bool(true, "Draw NY PM Box", inline="k3", group=grp_kz, display=display.none)
+c_bg_nypm     = input.color(color.new(#FF9800, 85), "", inline="k3", group=grp_kz, display=display.none)
+show_bg_lon   = input.bool(true, "Draw London Box", inline="k4", group=grp_kz, display=display.none)
+c_bg_lon      = input.color(color.new(#E91E63, 85), "", inline="k4", group=grp_kz, display=display.none)
+show_bg_asia  = input.bool(true, "Draw Asia Box", inline="k5", group=grp_kz, display=display.none)
+c_bg_asia     = input.color(color.new(#00BCD4, 85), "", inline="k5", group=grp_kz, display=display.none)
+
+grp_sess = "SESSION LIQUIDITY"
+sess_lookback = input.string("1 Day", "Lookback", options=["1 Day", "2 Days", "3 Days", "5 Days"], inline="sess_1", group=grp_sess, display=display.none)
+sess_lbl_sz   = input.string("Tiny", "Label Size", options=["Tiny", "Small", "Normal"], inline="sess_1", group=grp_sess, display=display.none)
+sess_style_in = input.string("Dotted", "Line Style", options=["Solid", "Dashed", "Dotted"], inline="sess_1", group=grp_sess, display=display.none)
+sess_preserve = input.bool(false, "Preserve Liquidity After Mitigation", group=grp_sess, display=display.none)
+
+show_liq_nyam  = input.bool(true, "NY AM Liq", inline="l1", group=grp_sess, display=display.none)
+c_liq_nyam     = input.color(color.new(#2962FF, 40), "", inline="l1", group=grp_sess, display=display.none)
+show_liq_lunch = input.bool(true, "Lunch Liq", inline="l2", group=grp_sess, display=display.none)
+c_liq_lunch    = input.color(color.new(#787b86, 40), "", inline="l2", group=grp_sess, display=display.none)
+show_liq_nypm  = input.bool(true, "NY PM Liq", inline="l3", group=grp_sess, display=display.none)
+c_liq_nypm     = input.color(color.new(#FF9800, 40), "", inline="l3", group=grp_sess, display=display.none)
+show_liq_lon   = input.bool(true, "London Liq", inline="l4", group=grp_sess, display=display.none)
+c_liq_lon      = input.color(color.new(#E91E63, 40), "", inline="l4", group=grp_sess, display=display.none)
+show_liq_asia  = input.bool(true, "Asia Liq", inline="l5", group=grp_sess, display=display.none)
+c_liq_asia     = input.color(color.new(#00BCD4, 40), "", inline="l5", group=grp_sess, display=display.none)
+
+show_pdhl = input.bool(true, "PDH/PDL", inline="pdhl", group=grp_sess, display=display.none)
+c_pdh     = input.color(color.new(#4CAF50, 40), "PDH", inline="pdhl", group=grp_sess, display=display.none)
+c_pdl     = input.color(color.new(#F44336, 40), "PDL", inline="pdhl", group=grp_sess, display=display.none)
+
+show_pwhl = input.bool(true, "PWH/PWL", inline="pwhl", group=grp_sess, display=display.none)
+c_pwh     = input.color(color.new(#4CAF50, 40), "PWH", inline="pwhl", group=grp_sess, display=display.none)
+c_pwl     = input.color(color.new(#F44336, 40), "PWL", inline="pwhl", group=grp_sess, display=display.none)
+
+// =============================================================================
+// --- 1.9 FILTRO DE KILLZONES (TRADING FILTERS) ---
+// =============================================================================
+grp_trade_kz = "STRICT KILLZONE FILTER"
+use_kz = input.bool(true, "Enable Strict Killzone Filter", tooltip="Penalizes or blocks setups that occur outside of your active trading sessions.", group=grp_trade_kz)
+
+// Solo los checkboxes para operar o no operar en esas sesiones 
+// (Los colores, fondos y horarios ya se controlan en el Master Menu)
+use_ny_am = input.bool(true, "Trade NY AM", inline="t1", group=grp_trade_kz)
+trade_nyl = input.bool(false, "Trade NY Lunch", inline="t1", group=grp_trade_kz)
+use_ny_pm = input.bool(true, "Trade NY PM", inline="t2", group=grp_trade_kz)
+use_lon   = input.bool(false, "Trade London", inline="t2", group=grp_trade_kz)
+use_asia  = input.bool(false, "Trade Asia", inline="t3", group=grp_trade_kz)
+
+// --- RELOJ INTERNO DEL ALGORITMO (Conectado al Master Time) ---
+// Aquí verificamos si la vela actual está dentro de las horas establecidas, forzando la hora NY
+in_am    = time(timeframe.period, t_nyam, "America/New_York") != 0
+in_nyl   = time(timeframe.period, t_lunch, "America/New_York") != 0
+in_pm    = time(timeframe.period, t_nypm, "America/New_York") != 0
+in_lon   = time(timeframe.period, t_lon, "America/New_York") != 0
+in_asia  = time(timeframe.period, t_asia, "America/New_York") != 0
+
+// Variable global que le dice al motor si está autorizado para disparar una entrada ahora mismo
+bool in_active_kz = (use_ny_am and in_am) or (trade_nyl and in_nyl) or (use_ny_pm and in_pm) or (use_lon and in_lon) or (use_asia and in_asia)
+
+// =============================================================================
+// --- 2. ADVANCED LIQUIDITY ---
+// =============================================================================
+grp_liq = "LIQUIDITY"
+
+align_mode   = input.string("Automatic", "Alignment Mode", options=["Automatic", "Manual"], inline="align_grp", group=grp_liq)
+align_tf     = input.string("15", "Timeframe", options=["5", "15", "60"], inline="align_grp", group=grp_liq, tooltip="Only active if Alignment Mode is 'Manual'. If set to 'Automatic', this box is completely ignored and the current chart timeframe is used.")
+liq_swing_str = input.int(1, "Structural Pivot Strength", minval=1, maxval=10, tooltip="Higher = less noise, requires more bars to confirm. retail = 1, structural = 3 to 5.", group=grp_liq)
+
+// --- NEW: Liquidity Levels Visibility (Matches your UI design) ---
+show_liq     = input.bool(true, "Show Liquidity:", inline="liq_lvl", group=grp_liq, display=display.none)
+c_bsl        = input.color(color.new(color.black, 40), "Buyside", inline="liq_lvl", group=grp_liq, display=display.none)
+c_ssl        = input.color(color.new(color.black, 40), "Sellside", inline="liq_lvl", group=grp_liq, display=display.none)
+
+liq_style_in = input.string("Dotted", "Line Style", options=["Solid", "Dashed", "Dotted"], inline="liq_style", group=grp_liq, display=display.none)
+liq_lbl_sz_in= input.string("Tiny", "Label Size", options=["Tiny", "Small", "Normal"], inline="liq_style", group=grp_liq, display=display.none)
+// --- NEW: Limit structural liquidity clutter ---
+max_liq_lines = input.int(8, "Max Visible Levels", minval=1, maxval=50, tooltip="Limits the number of structural BSL/SSL lines drawn on the chart. Older lines are hidden but kept in the algorithm's memory.", group=grp_liq, display=display.none)
+
+// --- Liquidity Sweeps ---
+show_sweeps  = input.bool(true, "Show Liquidity Sweeps", inline="swp", group=grp_liq, display=display.none)
+c_swp_line   = input.color(color.rgb(0, 0, 0), "", inline="swp", group=grp_liq, display=display.none)
+max_swp      = input.int(3, "Max Visible Sweeps", minval=1, maxval=20, group=grp_liq, display=display.none)
+
+// --- MACRO DATA HIGHS / LOWS (8:30 AM NY) ---
+show_data_in = input.bool(true, "Show Data High/Low", inline="data1", group=grp_liq, display=display.none)
+c_data       = input.color(color.new(color.black, 40), "", inline="data1", group=grp_liq, display=display.none)
+
+data_style_in= input.string("Solid", "Data Line Style", options=["Solid", "Dashed", "Dotted"], inline="data2", group=grp_liq, display=display.none)
+
+// Advanced Data Options
+data_pts     = input.float(6.0, "Wick Size Threshold (Points)", tooltip="Minimum wick size in points to validate the 8:30 AM swing.", group=grp_liq, display=display.none)
+data_lbl_sz  = input.string("Tiny", "Label Size", options=["Tiny", "Small", "Normal", "Large"], group=grp_liq, display=display.none)
+c_data_lbl   = input.color(color.new(color.black, 40), "Label Text Color", group=grp_liq, display=display.none)
+data_offset  = input.int(6, "Label Vertical Offset (Ticks)", tooltip="Distance to park the label after mitigation.", group=grp_liq, display=display.none)
+
+data_del_mit = input.bool(false, "Delete on Mitigation", tooltip="If true, immediately deletes the visual on first touch. If false, freezes the line and parks the label centered beneath/above.", group=grp_liq, display=display.none)
+data_cleanup = input.int(200, "Auto-cleanup after bars", tooltip="0 = disabled. Removes the unmitigated line after X bars to keep charts clean.", group=grp_liq, display=display.none)
+
+// =============================================================================
+// --- 2.1 REQH/L (RELATIVE EQUAL HIGHS & LOWS) ---
+// =============================================================================
+grp_reqh = "REQH/L"
+
+show_reqh_in = input.bool(true, "Show REQH/L:", inline="reqh_colors", group=grp_reqh, display=display.none)
+c_reqh_bsl   = input.color(color.new(#4a4a4a, 40), "Buyside", inline="reqh_colors", group=grp_reqh, display=display.none)
+c_reqh_ssl   = input.color(color.new(#4a4a4a, 40), "Sellside", inline="reqh_colors", group=grp_reqh, display=display.none)
+
+reqh_style_in= input.string("Solid", "Line Style", options=["Solid", "Dashed", "Dotted"], inline="reqh_style", group=grp_reqh, display=display.none)
+reqh_lbl_sz  = input.string("Tiny", "Label Size", options=["Tiny", "Small", "Normal"], inline="reqh_style", group=grp_reqh, display=display.none)
+
+show_reqh_lbl= input.bool(true, "Show Labels:", inline="reqh_lbl_pos", group=grp_reqh, display=display.none)
+reqh_lbl_pos = input.string("Right", "Label Placement", options=["Right", "Left"], inline="reqh_lbl_pos", group=grp_reqh, display=display.none)
+
+// Tolerancia institucional oculta a la vista para mantener la UI limpia (en Ticks)
+reqh_ticks   = input.int(10, "Tolerance (Ticks)", tooltip="Maximum difference in ticks to consider highs/lows as 'Relative Equals'.", group=grp_reqh, display=display.none)
+
+// =============================================================================
+// --- 3. FAIR VALUE GAPS (CON HTF CE / MIDLINE ESTRICTO) ---
+// =============================================================================
+grp_fvg = "FAIR VALUE GAPS"
+
+show_htf_fvg    = input.bool(true, "Show HTF FVGs", inline="fvg1", group=grp_fvg, display=display.none)
+show_htf_border = input.bool(false, "Show Border", inline="fvg1", group=grp_fvg, display=display.none)
+extend_htf      = input.int(10, "Extend HTF FVGs by X bars", group=grp_fvg, display=display.none)
+max_htf_fvgs    = input.int(3, "Max HTF FVGs to Display", minval=1, maxval=50, group=grp_fvg, display=display.none)
+clean_stacked   = input.bool(true, "Hide Nested FVGs (Clean Chart)", tooltip="If a lower timeframe FVG forms inside a higher timeframe FVG, the smaller one is hidden.", group=grp_fvg, display=display.none)
+
+c_htf_lbl        = input.color(color.new(#000000, 35), "Label Color", inline="fvg2", group=grp_fvg, display=display.none)
+sz_htf_lbl_in    = input.string("Tiny", "Label Size", options=["Auto", "Tiny", "Small", "Normal"], inline="fvg2", group=grp_fvg, display=display.none)
+
+c_htf_bull      = input.color(color.new(#636363, 90), "Bullish Color", inline="fvg3", group=grp_fvg, display=display.none)
+c_htf_bear      = input.color(color.new(#636363, 90), "Bearish Color", inline="fvg3", group=grp_fvg, display=display.none)
+
+c_htf_inv_bull  = input.color(color.new(#2e2e2e, 85), "Inverted Color for Bullish Inversions", group=grp_fvg, display=display.none)
+c_htf_inv_bear  = input.color(color.new(#2e2e2e, 85), "Inverted Color for Bearish Inversions", group=grp_fvg, display=display.none)
+
+// --- HTF FVG MIDLINE (CE) INPUTS ---
+show_htf_ce = input.bool(true, title="Show HTF FVG Midline (C.E.)", group="HTF FVG Settings")
+htf_ce_color = input.color(color.new(color.gray, 30), title="Midline Color", inline="ce1", group="HTF FVG Settings")
+htf_ce_style_str = input.string("Dashed", title="Midline Style", options=["Solid", "Dashed", "Dotted"], inline="ce1", group="HTF FVG Settings")
+
+// Función para traducir el texto del menú a un estilo de línea
+f_get_line_style(style_str) =>
+    style_str == "Solid" ? line.style_solid : style_str == "Dashed" ? line.style_dashed : line.style_dotted
+
+htf_ce_style = f_get_line_style(htf_ce_style_str)
+
+show_htf_inv    = input.bool(true, "Display Inversion", group=grp_fvg, display=display.none)
+
+var string sz_htf_lbl = size.tiny
+if sz_htf_lbl_in == "Small"
+    sz_htf_lbl := size.small
+else if sz_htf_lbl_in == "Normal"
+    sz_htf_lbl := size.normal
+else if sz_htf_lbl_in == "Auto"
+    sz_htf_lbl := size.auto
+
+// 🌟 ACTUALIZACIÓN DEL TIPO: Añadimos 'midline' para que la línea viva dentro de la caja
+type HtfFvg
+    box bx
+    line midline // <--- AQUI VIVIRÁ LA LÍNEA DEL CE
+    float top
+    float bot
+    bool is_bull
+    bool inverted
+    string tf
+    int last_time
+    int last_index 
+
+var htf_fvgs = array.new<HtfFvg>()
+
+// 🌟 FUNCIÓN DE FUSIÓN DE FVGs (LIQUIDITY VOID MOTOR) 🌟
+// Agregamos htf_atr a los parámetros
+f_create_htf_fvg(h1, l1, h3, l3, t2, t1_index, tf_label, htf_atr) =>
+    int right_time = time + (extend_htf * one_bar_ms) 
+    bool merged = false
+
+    bool is_bull_gap = l1 > h3
+    bool is_bear_gap = h1 < l3
+    float new_top = is_bull_gap ? l1 : (is_bear_gap ? l3 : na)
+    float new_bot = is_bull_gap ? h3 : (is_bear_gap ? h1 : na)
+
+    // 🌟 FILTRO ANTI-RUIDO (DISPLACEMENT FILTER) 🌟
+    // 0.5 significa que el FVG debe medir al menos la mitad del movimiento normal de una vela (ATR).
+    // Si quieres el gráfico AÚN MÁS LIMPIO, súbelo a 0.8 o 1.0. Si quieres ver más, bájalo a 0.3.
+    float noise_multiplier = 0.5 
+    if not na(htf_atr) and (new_top - new_bot) < (htf_atr * noise_multiplier)
+        // El gap es demasiado pequeño. Lo matamos apagando sus variables antes de que nazca.
+        is_bull_gap := false
+        is_bear_gap := false
+
+    int tf_mins = tf_label == "1H FVG" ? 60 : tf_label == "15M FVG" ? 15 : tf_label == "5M FVG" ? 5 : 0
+    int max_time_dist = tf_mins * 60000 * 3
+
+    // 1. INTENTAMOS FUSIONAR CON UNO EXISTENTE
+    if (is_bull_gap or is_bear_gap) and array.size(htf_fvgs) > 0
+        for i = array.size(htf_fvgs) - 1 to 0
+            last_fvg = array.get(htf_fvgs, i)
+            
+            // Requisito: Mismo Timeframe, Misma Dirección y que siga Vivo
+            if last_fvg.tf == tf_label and last_fvg.is_bull == is_bull_gap and not last_fvg.inverted
+                
+                // REGLA 1: Se superponen físicamente en el precio (Overlap)
+                bool price_overlap = math.max(last_fvg.bot, new_bot) <= math.min(last_fvg.top, new_top)
+                
+                // REGLA 2: No se tocan, pero son "Stacked FVGs" (Se formaron casi enseguida en el mismo impulso)
+                bool is_stacked = tf_mins > 0 and (t2 - last_fvg.last_time) <= max_time_dist
+                
+                if price_overlap or is_stacked
+                    // --- FUSIÓN DE CAJAS (Nace el Liquidity Void) ---
+                    last_fvg.top := math.max(last_fvg.top, new_top)
+                    last_fvg.bot := math.min(last_fvg.bot, new_bot)
+                    box.set_top(last_fvg.bx, last_fvg.top)
+                    box.set_bottom(last_fvg.bx, last_fvg.bot)
+                    box.set_right(last_fvg.bx, right_time)
+                    
+                    // --- FUSIÓN DEL CE (Línea central re-balanceada) ---
+                    if show_htf_ce and not na(last_fvg.midline)
+                        float new_mid = (last_fvg.top + last_fvg.bot) / 2
+                        line.set_y1(last_fvg.midline, new_mid)
+                        line.set_y2(last_fvg.midline, new_mid)
+                        line.set_x2(last_fvg.midline, right_time)
+
+                    last_fvg.last_time := t2
+                    last_fvg.last_index := t1_index 
+                    merged := true
+                    break 
+
+    // 2. SI NO HUBO FUSIÓN, CREAMOS UNO NUEVO
+    if not merged
+        if is_bull_gap 
+            color border_c = show_htf_border ? c_htf_bull : color(na)
+            box b = box.new(t2, new_top, right_time, new_bot, xloc=xloc.bar_time, text=tf_label, text_halign=text.align_right, text_valign=text.align_bottom, text_color=c_htf_lbl, text_size=sz_htf_lbl, border_color=border_c, bgcolor=c_htf_bull)
+            
+            line l = line(na)
+            if show_htf_ce
+                float mid_price = (new_top + new_bot) / 2
+                l := line.new(t2, mid_price, right_time, mid_price, xloc=xloc.bar_time, color=htf_ce_color, style=htf_ce_style, width=1)
+                
+            array.push(htf_fvgs, HtfFvg.new(b, l, new_top, new_bot, true, false, tf_label, t2, t1_index))
+            
+        if is_bear_gap 
+            color border_c = show_htf_border ? c_htf_bear : color(na)
+            box b = box.new(t2, new_top, right_time, new_bot, xloc=xloc.bar_time, text=tf_label, text_halign=text.align_right, text_valign=text.align_bottom, text_color=c_htf_lbl, text_size=sz_htf_lbl, border_color=border_c, bgcolor=c_htf_bear)
+            
+            line l = line(na)
+            if show_htf_ce
+                float mid_price = (new_top + new_bot) / 2
+                l := line.new(t2, mid_price, right_time, mid_price, xloc=xloc.bar_time, color=htf_ce_color, style=htf_ce_style, width=1)
+                
+            array.push(htf_fvgs, HtfFvg.new(b, l, new_top, new_bot, false, false, tf_label, t2, t1_index))
+
+/// 🌟 FUNCIÓN DE EXTRACCIÓN ACTUALIZADA (Ahora extrae el ATR institucional)
+f_htf_data() => [high[1], low[1], high[3], low[3], time[2], time[1], bar_index[1], ta.atr(14)]
+
+if show_htf_fvg
+    int chart_sec = timeframe.in_seconds(timeframe.period)
+
+    // HTF 1H (60M)
+    [h1_60, l1_60, h3_60, l3_60, t2_60, t1_60, t1_index_60, atr_60] = request.security(syminfo.tickerid, "60", f_htf_data(), lookahead=barmerge.lookahead_on)
+    bool new_60m = ta.change(t1_60) != 0
+    if new_60m and not na(t1_60) and chart_sec <= 3600
+        f_create_htf_fvg(h1_60, l1_60, h3_60, l3_60, t2_60, t1_index_60, "1H FVG", atr_60)
+
+    // HTF 15M
+    [h1_15, l1_15, h3_15, l3_15, t2_15, t1_15, t1_index_15, atr_15] = request.security(syminfo.tickerid, "15", f_htf_data(), lookahead=barmerge.lookahead_on)
+    bool new_15m = ta.change(t1_15) != 0
+    if new_15m and not na(t1_15) and chart_sec <= 900
+        f_create_htf_fvg(h1_15, l1_15, h3_15, l3_15, t2_15, t1_index_15, "15M FVG", atr_15)
+
+    // HTF 5M
+    [h1_5, l1_5, h3_5, l3_5, t2_5, t1_5, t1_index_5, atr_5] = request.security(syminfo.tickerid, "5", f_htf_data(), lookahead=barmerge.lookahead_on)
+    bool new_5m = ta.change(t1_5) != 0
+    if new_5m and not na(t1_5) and chart_sec <= 300
+        f_create_htf_fvg(h1_5, l1_5, h3_5, l3_5, t2_5, t1_index_5, "5M FVG", atr_5)
+
+    // LTF CURRENT 
+    bool is_new_curr_bar = ta.change(time[1]) != 0
+    
+    // 🌟 EXTRAEMOS EL ATR AL ESPACIO GLOBAL PARA EVITAR EL WARNING 🌟
+    float current_atr = ta.atr(14)
+    
+    if include_curr_tf and is_new_curr_bar
+        string tf_str = timeframe.isseconds ? str.tostring(timeframe.multiplier) + "S FVG" : timeframe.isminutes ? str.tostring(timeframe.multiplier) + "M FVG" : timeframe.isdaily ? "D FVG" : timeframe.isweekly ? "W FVG" : "TF"
+        f_create_htf_fvg(high[1], low[1], high[3], low[3], time[2], bar_index[1], tf_str, current_atr)
+        
+   // --- ANTI-STACKING VISUAL FILTER (Hierarchical Cleanup) ---
+    if clean_stacked and array.size(htf_fvgs) > 1
+        for i = array.size(htf_fvgs) - 1 to 0
+            if i < array.size(htf_fvgs)
+                f_child = array.get(htf_fvgs, i)
+                if not f_child.inverted
+                    bool is_overlapping = false
+                    for j = 0 to array.size(htf_fvgs) - 1
+                        if j < array.size(htf_fvgs) and i != j
+                            f_parent = array.get(htf_fvgs, j)
+                            if not f_parent.inverted and f_child.is_bull == f_parent.is_bull
+                                int rank_c = f_child.tf == "1H FVG" ? 4 : f_child.tf == "15M FVG" ? 3 : f_child.tf == "5M FVG" ? 2 : 1
+                                int rank_p = f_parent.tf == "1H FVG" ? 4 : f_parent.tf == "15M FVG" ? 3 : f_parent.tf == "5M FVG" ? 2 : 1
+                                
+                                if rank_p > rank_c
+                                    if math.max(f_child.bot, f_parent.bot) < math.min(f_child.top, f_parent.top)
+                                        is_overlapping := true
+                                        break
+                    if is_overlapping
+                        box.delete(f_child.bx)
+                        if not na(f_child.midline) // 🌟 Borrar el CE si se apila
+                            line.delete(f_child.midline)
+                        array.remove(htf_fvgs, i)
+
+    // LÓGICA DE MITIGACIÓN, REBOTES Y LIMPIEZA DE ZOMBIS
+    // 🌟 DETECTORES DE FRACTALES 🌟
+    bool is_swing_low  = low[1] <= low[2] and low[1] <= low
+    bool is_swing_high = high[1] >= high[2] and high[1] >= high
+
+    if array.size(htf_fvgs) > 0
+        for i = array.size(htf_fvgs) - 1 to 0
+            f = array.get(htf_fvgs, i)
+            bool deleted = false
+            
+            if not f.inverted
+                if f.is_bull
+                    if close < f.bot
+                        // ❌ INVALIDACIÓN: El cuerpo rompió la zona por completo
+                        if show_htf_inv
+                            f.inverted := true
+                            box.set_bgcolor(f.bx, c_htf_inv_bull)
+                            box.set_border_color(f.bx, show_htf_border ? c_htf_inv_bull : color(na))
+                            box.set_text(f.bx, f.tf + " (INV)") // Bonus: Le agrega "(INV)" si se vuelve IFVG
+                        else
+                            box.delete(f.bx)
+                            if not na(f.midline) 
+                                line.delete(f.midline)
+                            array.remove(htf_fvgs, i)
+                            deleted := true
+                            
+                    else 
+                        // 🟢 REBOTE ALCISTA: Actualiza el texto de la caja
+                        if is_swing_low and low[1] <= f.top and close[1] >= f.bot
+                            box.set_text(f.bx, f.tf + " ▲")
+
+                else // Es Bajista (Bearish)
+                    if close > f.top
+                        // ❌ INVALIDACIÓN: El cuerpo rompió la zona hacia arriba
+                        if show_htf_inv
+                            f.inverted := true
+                            box.set_bgcolor(f.bx, c_htf_inv_bear)
+                            box.set_border_color(f.bx, show_htf_border ? c_htf_inv_bear : color(na))
+                            box.set_text(f.bx, f.tf + " (INV)") // Bonus: Le agrega "(INV)" si se vuelve IFVG
+                        else
+                            box.delete(f.bx)
+                            if not na(f.midline) 
+                                line.delete(f.midline)
+                            array.remove(htf_fvgs, i)
+                            deleted := true
+                            
+                    else 
+                        // 🔴 REBOTE BAJISTA: Actualiza el texto de la caja
+                        if is_swing_high and high[1] >= f.bot and close[1] <= f.top
+                            box.set_text(f.bx, f.tf + " ▼")
+
+            else // --- Lógica de IFVGs (Invertidos) ---
+                if f.is_bull 
+                    if high >= f.top
+                        box.delete(f.bx)
+                        if not na(f.midline) 
+                            line.delete(f.midline)
+                        array.remove(htf_fvgs, i)
+                        deleted := true
+                else 
+                    if low <= f.bot
+                        box.delete(f.bx)
+                        if not na(f.midline) 
+                            line.delete(f.midline)
+                        array.remove(htf_fvgs, i)
+                        deleted := true
+
+            if not deleted
+                int right_time_upd = time + (extend_htf * one_bar_ms)
+                box.set_right(f.bx, right_time_upd)
+                if show_htf_ce and not na(f.midline) 
+                    line.set_x2(f.midline, right_time_upd)
+
+        // GC Optimizado: Limpieza segura de HTF FVGs (Anti-Borrado de HTF)
+        int actual_max_fvgs = include_curr_tf ? max_htf_fvgs + 15 : max_htf_fvgs
+        while array.size(htf_fvgs) > actual_max_fvgs
+            HtfFvg oldest = array.shift(htf_fvgs)
+            if not na(oldest.bx)
+                box.delete(oldest.bx)
+            if not na(oldest.midline) // 🌟 Limpiar memoria del CE viejo
+                line.delete(oldest.midline)
+                
+// =============================================================================
+// --- 4. SMT PRO+ SETTINGS ---
+// =============================================================================
+grp_smt   = "SMT"
+
+smt_corr_mode = input.string("Automatic", "Correlated Asset", options=["Automatic", "Manual"], group=grp_smt, display=display.none)
+smt_manual_sym= input.symbol("CME_MINI:ES1!", "", group=grp_smt, display=display.none)
+
+smt_sens      = input.string("Sensitive", "Sensitivity", options=["Sensitive", "Normal", "Strict"], group=grp_smt, display=display.none)
+smt_max_vis   = input.int(5, "Maximum visible SMTs", minval=1, group=grp_smt, display=display.none)
+smt_realtime  = input.bool(true, "Real-time SMTs", group=grp_smt, display=display.none)
+
+c_smt_bull    = input.color(color.rgb(0, 0, 0), "Bullish:", inline="smt_bull", group=grp_smt, display=display.none)
+sz_bull_w     = input.string("Thin", "", options=["Thin", "Medium", "Thick"], inline="smt_bull", group=grp_smt, display=display.none)
+st_bull_s     = input.string("Solid", "", options=["Solid", "Dashed", "Dotted"], inline="smt_bull", group=grp_smt, display=display.none)
+
+c_smt_bear    = input.color(color.rgb(0, 0, 0), "Bearish:", inline="smt_bear", group=grp_smt, display=display.none)
+sz_bear_w     = input.string("Thin", "", options=["Thin", "Medium", "Thick"], inline="smt_bear", group=grp_smt, display=display.none)
+st_bear_s     = input.string("Solid", "", options=["Solid", "Dashed", "Dotted"], inline="smt_bear", group=grp_smt, display=display.none)
+
+smt_show_lbl  = input.bool(true, "Label", inline="smt_lbl", group=grp_smt, display=display.none)
+c_smt_lbl     = input.color(color.gray, "", inline="smt_lbl", group=grp_smt, display=display.none)
+smt_lbl_sz    = input.string("Tiny", "Size", options=["Tiny", "Small", "Normal"], inline="smt_lbl", group=grp_smt, display=display.none)
+smt_show_sym  = input.bool(true, "Show symbol", inline="smt_lbl", group=grp_smt, display=display.none)
+
+// --- FUNCIONES DE ESTILO SMT ---
+f_get_width(w_str) =>
+    w_str == "Thin" ? 1 : w_str == "Medium" ? 2 : 3
+
+f_get_style(s_str) =>
+    s_str == "Solid" ? line.style_solid : s_str == "Dashed" ? line.style_dashed : line.style_dotted
+
+f_get_size(sz_str) =>
+    sz_str == "Tiny" ? size.tiny : sz_str == "Small" ? size.small : size.normal
+
+// --- EMPAREJAMIENTO AUTOMÁTICO ---
+f_get_auto_sym() =>
+    string t = syminfo.ticker
+    string pref = syminfo.prefix + ":"
+    if str.contains(t, "NQ")
+        pref + "ES1!"
+    else if str.contains(t, "ES")
+        pref + "NQ1!"
+    else if str.contains(t, "YM")
+        pref + "ES1!"
+    else if str.contains(t, "GC")
+        pref + "SI1!"
+    else
+        smt_manual_sym
+
+string target_sym = smt_corr_mode == "Automatic" ? f_get_auto_sym() : smt_manual_sym
+
+f_short_sym(s) =>
+    arr = str.split(s, ":")
+    string raw_name = array.get(arr, array.size(arr) - 1)
+    str.replace_all(raw_name, "1!", "") 
+
+string lbl_text_base = smt_show_sym ? "SMT w/ " + f_short_sym(target_sym) : "SMT"
+
+// (Mantenemos los inputs de ENTRY SETUPS igual)
+grp_style = "ENTRY SETUPS (RTD)"
+setup_look   = input.int(15, "Setup Validation Window (Bars)", group=grp_style, display=display.none)
+req_sweep    = input.bool(true, "Require Liquidity Sweep for Entry", tooltip="If disabled, it will mark valid iFVGs even if no Sweep occurred.", group=grp_style, display=display.none)
+req_pda_vip  = input.bool(true, "Allow HTF FVG Reaction", tooltip="If enabled, bouncing from an HTF FVG will validate the setup even without a Liquidity Sweep.", group=grp_style, display=display.none)
+show_hover   = input.bool(true, "Show Confluences on Hover", group=grp_style, display=display.none) 
+c_bull_box   = input.color(color.new(#0f0f0f, 60), "Bullish Box", group=grp_style, display=display.none)
+c_bull_entry = input.color(color.blue, "Bullish Line (RTD+)", group=grp_style, display=display.none)
+c_bear_box   = input.color(color.new(#0f0f0f, 60), "Bearish Box", group=grp_style, display=display.none)
+c_bear_entry = input.color(color.red, "Bearish Line (RTD-)", group=grp_style, display=display.none)
+
+// =============================================================================
+// --- 5. DASHBOARD & VARIABLES GLOBALES ---
+// =============================================================================
+grp_dash  = "DASHBOARD"
+show_dash       = input.bool(true, "Show Strategy Checklist", inline="dash1", group=grp_dash, display=display.none)
+show_chk_grade  = input.bool(true, "Show Setup Grade", inline="dash1", group=grp_dash, display=display.none)
+
+dash_pos        = input.string("Bottom Right", "Position", options=["Top Right", "Middle Right", "Bottom Right", "Top Left", "Middle Left", "Bottom Left"], inline="dash2", group=grp_dash, display=display.none)
+dash_txt_size_s = input.string("Small", "Table Text Size", options=["Tiny", "Small", "Normal", "Large"], inline="dash2", group=grp_dash, display=display.none)
+
+c_bg_soft       = input.color(color.new(#636363, 85), "Cell Background", inline="dash3", group=grp_dash, display=display.none)
+c_bg_head       = input.color(color.new(#636363, 75), "Header Background", inline="dash3", group=grp_dash, display=display.none)
+c_text_harm     = input.color(color.new(#ffffff, 0), "Header Text", inline="dash4", group=grp_dash, display=display.none)
+c_border        = input.color(color.new(#ffffff, 80), "Border Color", inline="dash4", group=grp_dash, display=display.none)
+
+// Toggles para cada fila de la Checklist
+show_chk_bias   = input.bool(true, "HTF Bias", inline="chk1", group=grp_dash, display=display.none)
+show_chk_sweep  = input.bool(true, "Liquidity Sweep", inline="chk1", group=grp_dash, display=display.none)
+show_chk_ifvg   = input.bool(true, "iFVG", inline="chk2", group=grp_dash, display=display.none)
+show_chk_mom    = input.bool(true, "Momentum", inline="chk2", group=grp_dash, display=display.none)
+show_chk_pda    = input.bool(true, "HTF PDA Delivery", inline="chk3", group=grp_dash, display=display.none)
+show_chk_pd     = input.bool(true, "Premium/Discount", inline="chk3", group=grp_dash, display=display.none)
+show_chk_dol    = input.bool(true, "Draw On Liquidity", inline="chk4", group=grp_dash, display=display.none)
+show_chk_smt    = input.bool(true, "SMT Divergence", inline="chk4", group=grp_dash, display=display.none)
+show_chk_qty    = input.bool(true, "Position Size", inline="chk5", group=grp_dash, display=display.none)
+
+// =============================================================================
+// --- CONFIGURACIÓN DEL PANEL DE ESTADÍSTICAS ---
+// =============================================================================
+grp_stats = "STATISTICS PANEL"
+
+show_stats       = input.bool(true, "Show Session Statistics", inline="stat1", group=grp_stats, display=display.none)
+stats_pos_str    = input.string("Bottom Left", "Stats Position", options=["Top Right", "Middle Right", "Bottom Right", "Top Left", "Middle Left", "Bottom Left"], inline="stat2", group=grp_stats, display=display.none)
+stats_txt_size_s = input.string("Small", "Stats Text Size", options=["Tiny", "Small", "Normal", "Large"], inline="stat2", group=grp_stats, display=display.none)
+
+// Toggles dinámicos para cada fila (Igual que la Checklist)
+show_stat_aplus  = input.bool(true, "Show Grade A+ Stats", inline="stat3", group=grp_stats, display=display.none)
+show_stat_a      = input.bool(true, "Show Grade A Stats", inline="stat4", group=grp_stats, display=display.none)
+show_stat_b      = input.bool(true, "Show Grade B Stats", inline="stat5", group=grp_stats, display=display.none)
+
+// --- CONVERSIÓN DINÁMICA DE TAMAÑO Y POSICIÓN (STATS) ---
+var string stats_pos_real = position.bottom_left
+if stats_pos_str == "Top Right"
+    stats_pos_real := position.top_right
+else if stats_pos_str == "Middle Right"
+    stats_pos_real := position.middle_right
+else if stats_pos_str == "Bottom Right"
+    stats_pos_real := position.bottom_right
+else if stats_pos_str == "Middle Left"
+    stats_pos_real := position.middle_left
+else if stats_pos_str == "Top Left"
+    stats_pos_real := position.top_left
+
+var string stats_txt_sz = size.small
+if stats_txt_size_s == "Tiny"
+    stats_txt_sz := size.tiny
+else if stats_txt_size_s == "Normal"
+    stats_txt_sz := size.normal
+else if stats_txt_size_s == "Large"
+    stats_txt_sz := size.large
+
+// =============================================================================
+// --- CONFIGURACIÓN DEL AUTO-BIAS Y MINI BOX ---
+// =============================================================================
+grp_bias = "HTF AUTO-BIAS"
+enable_auto_bias = input.bool(false, "Enable HTF Auto-Bias Engine", group=grp_bias, display=display.none)
+
+// =============================================================================
+// --- CEREBRO HTF AUTO-BIAS (NATIVO EN HTF) ---
+// =============================================================================
+f_calc_bias_score() =>
+    float ph = ta.pivothigh(high, 5, 5)
+    float pl = ta.pivotlow(low, 5, 5)
+    
+    var float last_ph = na
+    var float last_pl = na
+    
+    if not na(ph)
+        last_ph := ph
+    if not na(pl)
+        last_pl := pl
+        
+    int score = 0
+    
+    if not na(last_ph)
+        if high > last_ph and close <= last_ph
+            score -= 2 // BSL Sweep (Reversión Bajista)
+        else if close > last_ph
+            score += 1 // BOS Alcista
+            
+    if not na(last_pl)
+        if low < last_pl and close >= last_pl
+            score += 2 // SSL Sweep (Reversión Alcista)
+        else if close < last_pl
+            score -= 1 // MSS Bajista
+            
+    score
+
+// OPTIMIZACIÓN FASE 3: Solo pedimos data HTF si el Auto-Bias está encendido
+int score_1h = request.security(enable_auto_bias ? syminfo.tickerid : na, "60", f_calc_bias_score(), lookahead=barmerge.lookahead_on)
+int score_4h = request.security(enable_auto_bias ? syminfo.tickerid : na, "240", f_calc_bias_score(), lookahead=barmerge.lookahead_on)
+
+int total_bias_score = 0
+if not na(score_1h)
+    total_bias_score += score_1h
+if not na(score_4h)
+    total_bias_score += (score_4h * 2)
+
+string dynamic_bias = total_bias_score > 0 ? "Bullish" : total_bias_score < 0 ? "Bearish" : "Neutro"
+
+// Lógica del interruptor: Si Auto-Bias está activo, usa el dinámico, si no, usa tu input manual.
+string active_bias = enable_auto_bias ? dynamic_bias : bias_input
+
+// Actualizamos las variables globales de visualización solo si está activo
+if enable_auto_bias
+    show_bull := active_bias != "Bearish"
+    show_bear := active_bias != "Bullish"
+
+
+// --- CONVERSIÓN DINÁMICA DE TAMAÑO Y POSICIÓN ---
+var string pos_str = position.bottom_right
+if dash_pos == "Top Right"
+    pos_str := position.top_right
+else if dash_pos == "Middle Right"
+    pos_str := position.middle_right
+else if dash_pos == "Bottom Left"
+    pos_str := position.bottom_left
+else if dash_pos == "Middle Left"
+    pos_str := position.middle_left
+else if dash_pos == "Top Left"
+    pos_str := position.top_left
+
+var string dash_txt_sz = size.small
+if dash_txt_size_s == "Tiny"
+    dash_txt_sz := size.tiny
+else if dash_txt_size_s == "Normal"
+    dash_txt_sz := size.normal
+else if dash_txt_size_s == "Large"
+    dash_txt_sz := size.large
+
+// --- VARIABLES GLOBALES DEL MOTOR ---
+var int last_bsl_sweep_time = 0
+var int last_ssl_sweep_time = 0
+var bool bull_context = false
+var bool bear_context = false
+
+int ms_limit = setup_look * one_bar_ms
+
+var line[]  hist_swp_lines  = array.new_line()
+var label[] hist_swp_labels = array.new_label()
+
+var string t_grade = "N/A"
+var bool t_liq = false
+var bool t_pd = false
+var bool t_mom = false
+var bool t_ifvg = false
+var bool t_smt = false
+var bool t_targets = false
+
+float global_hh = ta.highest(high, 100)
+float global_ll = ta.lowest(low, 100)
+float global_eq = (global_hh + global_ll) / 2
+float global_atr = ta.atr(14)
+
+float highest_3 = ta.highest(high, 3)
+float lowest_3 = ta.lowest(low, 3)
+
+f_get_grade(is_bull_setup, c, o, eq, atr_val) =>
+    bool in_discount = c < eq
+    bool in_premium  = c > eq
+    bool good_pd = (is_bull_setup and in_discount) or (not is_bull_setup and in_premium)
+    float body = math.abs(c - o)
+    bool strong_mom = body >= (atr_val * 0.8)
+    bool weak_mom   = body < (atr_val * 0.5)
+    
+    string g_str = "C"
+    int g_val = 0
+    if good_pd
+        if strong_mom
+            g_str := "A+"
+            g_val := 5
+        else if weak_mom
+            g_str := "A-"
+            g_val := 3
+        else
+            g_str := "A"
+            g_val := 4
+    else
+        if strong_mom
+            g_str := "B+"
+            g_val := 2
+        else if weak_mom
+            g_str := "C"
+            g_val := 0
+        else
+            g_str := "B"
+            g_val := 1
+    [g_str, g_val, good_pd, strong_mom]
+
+// =============================================================================
+// --- 6. MOTOR DE LIQUIDEZ Y DECLARACIONES ---
+// =============================================================================
+type VisualPlan
+    line l_sl
+    line l_be
+    line l_tp1
+    line l_tp2
+    label lb_sl
+    label lb_be
+    label lb_tp1
+    label lb_tp2
+    bool be_hit
+    bool tp1_hit
+    bool tp2_hit
+    float p_be    // NUEVO: Memoria del precio BE
+    float p_tp1   // NUEVO: Memoria del precio TP1
+    float p_tp2   // NUEVO: Memoria del precio TP2
+
+type ActiveSetup
+    box   bx
+    line  ln
+    label lb
+    float invalid_level
+    bool  is_bull
+    int   start_time
+    float top_level
+    float bot_level
+    string g_str
+    bool  t_liq
+    bool  t_pd
+    bool  t_mom
+    bool  t_smt
+    bool  t_targets
+    string target_str
+    float contract_qty
+    float sl_dist_pts
+    bool  is_active
+    VisualPlan viz
+
+var active_setups = array.new<ActiveSetup>()
+
+type Liq
+    float lvl
+    bool  is_bsl
+    int   t_start
+    string name 
+    line  ln
+    label lbl
+
+var liqs = array.new<Liq>()
+
+    // --- TRADUCTORES DE ESTILO PARA LA LIQUIDEZ ---
+string liq_line_style = liq_style_in == "Solid" ? line.style_solid : liq_style_in == "Dashed" ? line.style_dashed : line.style_dotted
+string liq_label_size = liq_lbl_sz_in == "Small" ? size.small : liq_lbl_sz_in == "Normal" ? size.normal : size.tiny
+
+// --- MEMORIA Y TRADUCTORES PARA REQH/L ---
+type ReqLiq
+    float lvl
+    bool is_bsl
+    line ln
+    label lbl
+
+var reqh_list = array.new<ReqLiq>()
+
+string reqh_line_style = reqh_style_in == "Solid" ? line.style_solid : reqh_style_in == "Dashed" ? line.style_dashed : line.style_dotted
+string reqh_label_size = reqh_lbl_sz == "Small" ? size.small : reqh_lbl_sz == "Normal" ? size.normal : size.tiny
+string reqh_label_align = reqh_lbl_pos == "Left" ? label.style_label_right : label.style_label_left
+
+f_manage_struct_liq(string tf) =>
+    // Usamos el input dinámico en lugar del 5,5 fijo
+    [h, h_t, l, l_t] = request.security(syminfo.tickerid, tf, [ta.pivothigh(high, liq_swing_str, liq_swing_str), time[liq_swing_str], ta.pivotlow(low, liq_swing_str, liq_swing_str), time[liq_swing_str]], lookahead=barmerge.lookahead_on)
+    
+    // Calculamos la tolerancia en precio (Ticks * Valor del Tick del activo)
+    float tolerance = reqh_ticks * syminfo.mintick
+
+    if not na(h) and (na(h[1]) or h != h[1] or h_t != h_t[1])
+        line ln_h = show_liq ? line.new(h_t, h, time, h, xloc=xloc.bar_time, color=c_bsl, style=liq_line_style) : line(na)
+        label lb_h = show_liq ? label.new(time, h, "BSL", xloc=xloc.bar_time, color=color(na), textcolor=c_bsl, style=label.style_label_left, size=liq_label_size) : label(na)
+        array.push(liqs, Liq.new(h, true, h_t, "", ln_h, lb_h))
+        
+        // 🌟 DETECCIÓN DE REQH (Relative Equal Highs) 🌟
+        if array.size(liqs) > 1
+            for i = 0 to array.size(liqs) - 2
+                old_liq = array.get(liqs, i)
+                if old_liq.is_bsl and old_liq.name == "" and math.abs(old_liq.lvl - h) <= tolerance
+                    float reqh_lvl = math.max(old_liq.lvl, h) // Usamos el más alto de los dos para seguridad
+                    line r_ln = show_reqh_in ? line.new(old_liq.t_start, reqh_lvl, time, reqh_lvl, xloc=xloc.bar_time, color=c_reqh_bsl, style=reqh_line_style) : line(na)
+                    label r_lb = (show_reqh_in and show_reqh_lbl) ? label.new(time, reqh_lvl, "REQH", xloc=xloc.bar_time, color=color(na), textcolor=c_reqh_bsl, style=reqh_label_align, size=reqh_label_size) : label(na)
+                    array.push(reqh_list, ReqLiq.new(reqh_lvl, true, r_ln, r_lb))
+                    break // Solo emparejamos con el más reciente válido
+
+    if not na(l) and (na(l[1]) or l != l[1] or l_t != l_t[1])
+        line ln_l = show_liq ? line.new(l_t, l, time, l, xloc=xloc.bar_time, color=c_ssl, style=liq_line_style) : line(na)
+        label lb_l = show_liq ? label.new(time, l, "SSL", xloc=xloc.bar_time, color=color(na), textcolor=c_ssl, style=label.style_label_left, size=liq_label_size) : label(na)
+        array.push(liqs, Liq.new(l, false, l_t, "", ln_l, lb_l))
+        
+        // 🌟 DETECCIÓN DE REQL (Relative Equal Lows) 🌟
+        if array.size(liqs) > 1
+            for i = 0 to array.size(liqs) - 2
+                old_liq = array.get(liqs, i)
+                if not old_liq.is_bsl and old_liq.name == "" and math.abs(old_liq.lvl - l) <= tolerance
+                    float reql_lvl = math.min(old_liq.lvl, l) // Usamos el más bajo de los dos para seguridad
+                    line r_ln = show_reqh_in ? line.new(old_liq.t_start, reql_lvl, time, reql_lvl, xloc=xloc.bar_time, color=c_reqh_ssl, style=reqh_line_style) : line(na)
+                    label r_lb = (show_reqh_in and show_reqh_lbl) ? label.new(time, reql_lvl, "REQL", xloc=xloc.bar_time, color=color(na), textcolor=c_reqh_ssl, style=reqh_label_align, size=reqh_label_size) : label(na)
+                    array.push(reqh_list, ReqLiq.new(reql_lvl, false, r_ln, r_lb))
+                    break // Solo emparejamos con el más reciente válido
+
+f_manage_struct_liq(align_mode == "Automatic" ? timeframe.period : align_tf)
+
+// --- MOTOR DE SESSION LIQUIDITY (PDH/PDL, PWH/PWL & INTRADAY) ---
+string sess_line_style = sess_style_in == "Solid" ? line.style_solid : sess_style_in == "Dashed" ? line.style_dashed : line.style_dotted
+string sess_label_size = sess_lbl_sz == "Small" ? size.small : sess_lbl_sz == "Normal" ? size.normal : size.tiny
+
+// =============================================================================
+// --- 1. Detección PDH / PDL (Rastreador de Precisión Intradía) ---
+// =============================================================================
+// Variables de rastreo en vivo (Día actual)
+var float cur_dh = na, var int cur_dh_t = na
+var float cur_dl = na, var int cur_dl_t = na
+
+// Memoria del día anterior
+var float prev_dh = na, var int prev_dh_t = na
+var float prev_dl = na, var int prev_dl_t = na
+
+bool is_new_day = ta.change(time("D")) != 0
+
+if is_new_day
+    prev_dh := cur_dh, prev_dh_t := cur_dh_t
+    prev_dl := cur_dl, prev_dl_t := cur_dl_t
+    
+    cur_dh := high, cur_dh_t := time
+    cur_dl := low,  cur_dl_t := time
+else
+    if na(cur_dh) or high > cur_dh
+        cur_dh := high, cur_dh_t := time
+    if na(cur_dl) or low < cur_dl
+        cur_dl := low,  cur_dl_t := time
+
+// --- DIBUJO PDH / PDL ---
+if is_new_day and show_pdhl and not na(prev_dh)
+    // 🌟 Eliminamos el bloque que borraba líneas injustamente.
+    // Ahora, si un PDH no fue mitigado, se queda en el radar hasta que el Lookback lo elimine.
+                
+    line ln_dh = line.new(prev_dh_t, prev_dh, time, prev_dh, xloc=xloc.bar_time, color=c_pdh, style=sess_line_style)
+    label lb_dh = label.new(time, prev_dh, "PDH", xloc=xloc.bar_time, color=color(na), textcolor=c_pdh, style=label.style_label_left, size=sess_label_size)
+    array.push(liqs, Liq.new(prev_dh, true, prev_dh_t, "PDH", ln_dh, lb_dh))
+    
+    line ln_dl = line.new(prev_dl_t, prev_dl, time, prev_dl, xloc=xloc.bar_time, color=c_pdl, style=sess_line_style)
+    label lb_dl = label.new(time, prev_dl, "PDL", xloc=xloc.bar_time, color=color(na), textcolor=c_pdl, style=label.style_label_left, size=sess_label_size)
+    array.push(liqs, Liq.new(prev_dl, false, prev_dl_t, "PDL", ln_dl, lb_dl))
+
+
+// =============================================================================
+// --- 2. Detección PWH / PWL (Rastreador de Precisión Semanal) ---
+// =============================================================================
+// Variables de rastreo en vivo (Semana actual)
+var float cur_wh = na, var int cur_wh_t = na
+var float cur_wl = na, var int cur_wl_t = na
+
+// Memoria de la semana anterior
+var float prev_wh = na, var int prev_wh_t = na
+var float prev_wl = na, var int prev_wl_t = na
+
+bool is_new_week = ta.change(time("W")) != 0
+
+if is_new_week
+    prev_wh := cur_wh, prev_wh_t := cur_wh_t
+    prev_wl := cur_wl, prev_wl_t := cur_wl_t
+    
+    cur_wh := high, cur_wh_t := time
+    cur_wl := low,  cur_wl_t := time
+else
+    if na(cur_wh) or high > cur_wh
+        cur_wh := high, cur_wh_t := time
+    if na(cur_wl) or low < cur_wl
+        cur_wl := low,  cur_wl_t := time
+
+/// --- DIBUJO PWH / PWL ---
+if is_new_week and show_pwhl and not na(prev_wh)
+    // 🌟 Eliminamos la limpieza forzada aquí también
+    
+    line ln_wh = line.new(prev_wh_t, prev_wh, time, prev_wh, xloc=xloc.bar_time, color=c_pwh, style=sess_line_style)
+    label lb_wh = label.new(time, prev_wh, "PWH", xloc=xloc.bar_time, color=color(na), textcolor=c_pwh, style=label.style_label_left, size=sess_label_size)
+    array.push(liqs, Liq.new(prev_wh, true, prev_wh_t, "PWH", ln_wh, lb_wh))
+    
+    line ln_wl = line.new(prev_wl_t, prev_wl, time, prev_wl, xloc=xloc.bar_time, color=c_pwl, style=sess_line_style)
+    label lb_wl = label.new(time, prev_wl, "PWL", xloc=xloc.bar_time, color=color(na), textcolor=c_pwl, style=label.style_label_left, size=sess_label_size)
+    array.push(liqs, Liq.new(prev_wl, false, prev_wl_t, "PWL", ln_wl, lb_wl))
+
+// 3. Detección Sesiones Intradía y Killzones (MOTOR MAESTRO UNIFICADO)
+f_detect_session(sess_str, name, show_bg, c_bg, show_liq, c_liq) =>
+    in_sess = time(timeframe.period, sess_str, "America/New_York") != 0
+    
+    var float s_h = na, var float s_l = na
+    var int t_h = na, var int t_l = na
+    var int start_t = na
+    var box kz_box = na
+    
+    if in_sess and not in_sess[1]
+        s_h := high, s_l := low
+        t_h := time, t_l := time
+        start_t := time
+        if show_bg
+            kz_box := box.new(start_t, s_h, time, s_l, xloc=xloc.bar_time, border_color=color.new(c_bg, 50), border_width=1, bgcolor=c_bg)
+    else if in_sess
+        if high > s_h
+            s_h := high, t_h := time
+        if low < s_l
+            s_l := low, t_l := time
+            
+        if show_bg and not na(kz_box)
+            box.set_top(kz_box, s_h)
+            box.set_bottom(kz_box, s_l)
+            box.set_right(kz_box, time)
+            
+    if not in_sess and in_sess[1] and show_liq
+        // 🌟 CREACIÓN INDEPENDIENTE (Sin empalmes ni fusiones) 🌟
+        line ln_h = line.new(t_h, s_h, time, s_h, xloc=xloc.bar_time, color=c_liq, style=sess_line_style)
+        label lb_h = label.new(time, s_h, name + "H", xloc=xloc.bar_time, color=color(na), textcolor=c_liq, style=label.style_label_left, size=sess_label_size)
+        array.push(liqs, Liq.new(s_h, true, t_h, name + "H", ln_h, lb_h))
+        
+        line ln_l = line.new(t_l, s_l, time, s_l, xloc=xloc.bar_time, color=c_liq, style=sess_line_style)
+        label lb_l = label.new(time, s_l, name + "L", xloc=xloc.bar_time, color=color(na), textcolor=c_liq, style=label.style_label_left, size=sess_label_size)
+        array.push(liqs, Liq.new(s_l, false, t_l, name + "L", ln_l, lb_l))
+
+// Ejecutamos el motor centralizado
+f_detect_session(t_nyam,   "NYAM ", show_bg_nyam,  c_bg_nyam,  show_liq_nyam,  c_liq_nyam)
+f_detect_session(t_lunch,  "LUNCH ",show_bg_lunch, c_bg_lunch, show_liq_lunch, c_liq_lunch)
+f_detect_session(t_nypm,   "NYPM ", show_bg_nypm,  c_bg_nypm,  show_liq_nypm,  c_liq_nypm)
+f_detect_session(t_lon,    "LON ",  show_bg_lon,   c_bg_lon,   show_liq_lon,   c_liq_lon)
+f_detect_session(t_asia,   "ASIA ", show_bg_asia,  c_bg_asia,  show_liq_asia,  c_liq_asia)
+
+// =============================================================================
+// --- MOTOR DE TRACKING Y BARRIDO (LIQS: PDH/PDL, SESIONES) ---
+// =============================================================================
+bool current_ssl_sweep = false
+bool current_bsl_sweep = false  
+
+if array.size(liqs) > 0
+    for i = array.size(liqs) - 1 to 0
+        item = array.get(liqs, i)
+        bool delete_line = false
+        bool is_sweep = false
+        bool is_expired = false 
+        
+        // Lógica de Lookback
+        int lookback_ms = sess_lookback == "1 Day" ? 86400000 : sess_lookback == "2 Days" ? 172800000 : sess_lookback == "3 Days" ? 259200000 : 432000000
+        if time - item.t_start > lookback_ms
+            delete_line := true
+            is_expired := true 
+        
+        // Lógica de Mitigación (Aceptando barridos con mecha Y cuerpo)
+        if not is_expired
+            if item.is_bsl
+                if high[1] >= item.lvl
+                    delete_line := true 
+                    is_sweep := true 
+                    current_bsl_sweep := true
+            else
+                if low[1] <= item.lvl
+                    delete_line := true 
+                    is_sweep := true 
+                    current_ssl_sweep := true
+
+        // Ejecución y Dibujo de Barridos
+        if delete_line
+            if not na(item.ln)
+                if is_expired
+                    line.delete(item.ln)
+                    label.delete(item.lbl)
+                else
+                    if item.name == "" 
+                        line.delete(item.ln)
+                        label.delete(item.lbl)
+                    else 
+                        if sess_preserve
+                            line.set_x2(item.ln, time[1])
+                            label.set_x(item.lbl, time[1])
+                        else
+                            line.delete(item.ln)
+                            label.delete(item.lbl)
+            array.remove(liqs, i)
+            
+           // 🌟 EJECUCIÓN Y DIBUJO DE BARRIDOS EN LA ESTRUCTURA 🌟
+            if is_sweep and show_sweeps and item.name != ""
+                // 1. Dibujamos la línea punteada normal
+                line l_swp = line.new(item.t_start, item.lvl, time[1], item.lvl, xloc=xloc.bar_time, color=c_swp_line, style=line.style_dotted)
+                
+                // 2. Calculamos el centro temporal exacto de esa línea
+                int center_time = math.round((item.t_start + time[1]) / 2)
+                
+                // 3. Imprimimos el $$$ en el centro, con estilo limpio (sin bordes ni flechas)
+                label lb_swp = label.new(center_time, item.lvl, "$$$", xloc=xloc.bar_time, color=color(na), textcolor=c_swp_line, style=label.style_none, size=size.small)
+                
+                array.push(hist_swp_lines, l_swp)
+                array.push(hist_swp_labels, lb_swp)
+        else
+            // Proyección dinámica
+            if not na(item.ln)
+                int bar_ms = time - time[1]
+                bool is_macro = item.name == "PDH" or item.name == "PDL" or item.name == "PWH" or item.name == "PWL"
+                int future_offset = is_macro ? (bar_ms * 45) : (bar_ms * 15) 
+                
+                line.set_x2(item.ln, time + future_offset)
+                label.set_x(item.lbl, time + future_offset)
+
+if current_bsl_sweep
+    last_bsl_sweep_time := time
+    bear_context := true
+    
+if current_ssl_sweep
+    last_ssl_sweep_time := time
+    bull_context := true
+
+// 🌟 GARBAGE COLLECTOR PROTEGIDO 🌟
+while array.size(hist_swp_lines) > max_swp
+    if array.size(hist_swp_lines) > 0
+        line.delete(array.shift(hist_swp_lines))
+while array.size(hist_swp_labels) > max_swp
+    if array.size(hist_swp_labels) > 0
+        label.delete(array.shift(hist_swp_labels))
+
+// Limpiamos las etiquetas si superan el límite, sin importar las líneas
+while array.size(hist_swp_labels) > max_swp
+    if array.size(hist_swp_labels) > 0
+        label.delete(array.shift(hist_swp_labels))
+
+
+// =============================================================================
+// --- MOTOR DE TRACKING Y BARRIDO PARA REQH / REQL ---
+// =============================================================================
+if array.size(reqh_list) > 0
+    for i = array.size(reqh_list) - 1 to 0
+        r_item = array.get(reqh_list, i)
+        bool delete_req = false
+        
+        // 🌟 LÓGICA DE MITIGACIÓN ARREGLADA (Instantánea) 🌟
+        if r_item.is_bsl
+            if high >= r_item.lvl
+                delete_req := true 
+        else
+            if low <= r_item.lvl
+                delete_req := true 
+
+        if delete_req
+            if not na(r_item.ln)
+                line.delete(r_item.ln)
+                label.delete(r_item.lbl)
+            array.remove(reqh_list, i)
+        else
+            // Actualizamos la posición visual de la línea y la etiqueta
+            if not na(r_item.ln)
+                line.set_x2(r_item.ln, time + one_bar_ms * 3)
+                int lbl_x = reqh_lbl_pos == "Right" ? time + one_bar_ms * 3 : line.get_x1(r_item.ln)
+                label.set_x(r_item.lbl, lbl_x)
+
+// --- FILTRO ANTI-CLUTTER VISUAL PARA LIQUIDEZ ESTRUCTURAL ---
+int active_liq_count = 0
+if array.size(liqs) > 0
+    // Recorremos de más nuevo a más viejo
+    for i = array.size(liqs) - 1 to 0 
+        item = array.get(liqs, i)
+        // Solo contamos las líneas estructurales (name == "") que están dibujadas
+        if item.name == "" and not na(item.ln)
+            active_liq_count += 1
+            if active_liq_count > max_liq_lines
+                // Si nos pasamos del límite visual, borramos la pintura pero conservamos la memoria
+                line.delete(item.ln)
+                label.delete(item.lbl)
+                item.ln := line(na)
+                item.lbl := label(na)
+
+// GC Optimizado: Limpieza de Liquidez Estructural
+while array.size(liqs) > 80
+    Liq oldest_liq = array.shift(liqs)
+    if not na(oldest_liq.ln)
+        line.delete(oldest_liq.ln)
+    if not na(oldest_liq.lbl)
+        label.delete(oldest_liq.lbl)
+
+// OPTIMIZACIÓN FASE 3: Motor de Data Highs / Lows (Basado en Noticias Macro)
+var float global_dh = na
+var float global_dl = na
+
+// Extraemos la hora de Nueva York de la vela actual
+int ny_h = hour(time, "America/New_York")
+int ny_m = minute(time, "America/New_York")
+
+// Ventana de 5 minutos para capturar la mecha completa del evento en temporalidades menores (1m, 3m, 5m)
+bool is_news_start = (ny_h == 8 and ny_m == 30) or (ny_h == 10 and ny_m == 0) or (ny_h == 14 and ny_m == 0)
+bool in_news_window = (ny_h == 8 and ny_m >= 30 and ny_m <= 34) or (ny_h == 10 and ny_m >= 0 and ny_m <= 4) or (ny_h == 14 and ny_m >= 0 and ny_m <= 4)
+
+// Reseteo diario a la medianoche para no arrastrar noticias de días pasados
+if ta.change(time("D")) != 0
+    global_dh := na
+    global_dl := na
+
+if in_news_window
+    if is_news_start
+        global_dh := high
+        global_dl := low
+    else
+        global_dh := math.max(nz(global_dh, high), high)
+        global_dl := math.min(nz(global_dl, low), low)
+
+type DataEvent
+    float lvl
+    bool is_high
+    int start_t
+    line ln
+    label lbl
+    bool mitigated
+    int bar_count
+
+var DataEvent active_data = na
+
+// --- FUNCIÓN REDISEÑADA: Escaneo de DOL (Híbrido: Liquidez + FVGs) ---
+f_check_dol(is_bull_setup, current_close, atr) =>
+    float[] tps = array.new_float()
+    string[] nms = array.new_string()
+
+    // 1. Data Highs / Lows (8:30 AM)
+    if not na(active_data) and not active_data.mitigated
+        if is_bull_setup and active_data.is_high and active_data.lvl > current_close
+            array.push(tps, active_data.lvl), array.push(nms, "Data High")
+        else if not is_bull_setup and not active_data.is_high and active_data.lvl < current_close
+            array.push(tps, active_data.lvl), array.push(nms, "Data Low")
+
+    // 2. Relative Equal Highs / Lows
+    if array.size(reqh_list) > 0
+        for i = 0 to array.size(reqh_list) - 1
+            req_item = array.get(reqh_list, i)
+            if is_bull_setup and req_item.is_bsl and req_item.lvl > current_close
+                array.push(tps, req_item.lvl), array.push(nms, "REQH")
+            else if not is_bull_setup and not req_item.is_bsl and req_item.lvl < current_close
+                array.push(tps, req_item.lvl), array.push(nms, "REQL")
+
+    // 3. Liquidez Estructural, Macro y de Sesiones
+    if array.size(liqs) > 0
+        for i = 0 to array.size(liqs) - 1
+            item = array.get(liqs, i)
+            if is_bull_setup and item.is_bsl and item.lvl > current_close
+                array.push(tps, item.lvl)
+                string n = item.name == "" ? "BSL" : (item.name == "PDH" or item.name == "PWH" ? item.name : "Session High")
+                array.push(nms, n)
+            else if not is_bull_setup and not item.is_bsl and item.lvl < current_close
+                array.push(tps, item.lvl)
+                string n = item.name == "" ? "SSL" : (item.name == "PDL" or item.name == "PWL" ? item.name : "Session Low")
+                array.push(nms, n)
+
+    // 4. 🌟 NUEVO: Ineficiencias (FVGs no mitigados) como DOL Interno 🌟
+    for i = 1 to 150
+        if is_bull_setup
+            // FVG Bajista arriba de nosotros (Imán para compras)
+            float fvg_bot = high[i]
+            float fvg_top = low[i+2]
+            if fvg_bot < fvg_top and fvg_bot > current_close
+                bool is_mitigated = false
+                for j = i - 1 to 0
+                    if high[j] >= fvg_top
+                        is_mitigated := true
+                        break
+                if not is_mitigated
+                    array.push(tps, fvg_bot), array.push(nms, "FVG")
+        else
+            // FVG Alcista debajo de nosotros (Imán para ventas)
+            float fvg_top = low[i]
+            float fvg_bot = high[i+2]
+            if fvg_top > fvg_bot and fvg_top < current_close
+                bool is_mitigated = false
+                for j = i - 1 to 0
+                    if low[j] <= fvg_bot
+                        is_mitigated := true
+                        break
+                if not is_mitigated
+                    array.push(tps, fvg_top), array.push(nms, "FVG")
+
+    bool has_dol = array.size(tps) > 0
+    string target_names = ""
+    
+    if has_dol
+        int[] sorted_idx = array.sort_indices(tps, is_bull_setup ? order.ascending : order.descending)
+        string tp1_name = array.get(nms, array.get(sorted_idx, 0))
+        target_names += tp1_name
+        
+        if array.size(tps) > 1
+            string tp2_name = array.get(nms, array.get(sorted_idx, 1))
+            if tp2_name != tp1_name 
+                target_names += ", " + tp2_name
+                
+    [has_dol, target_names]
+
+// --- MOTOR DE EJECUCIÓN: SMART MONEY TIER LIST ---
+f_get_exec_plan(is_bull, current_close, be_safe, use_fr_filter, current_atr) =>
+    float price_baseline = use_fr_filter ? close[1] : current_close
+
+    // Clasificamos los objetivos por Tiers según la imagen
+    float[] tier_s_vals = array.new_float(), int[] tier_s_times = array.new_int() // Data High/Low
+    float[] tier_b_vals = array.new_float(), int[] tier_b_times = array.new_int() // Sessions, PDH/PDL, REQH/REQL
+    float[] tier_c_vals = array.new_float(), int[] tier_c_times = array.new_int() // FVGs (Unbalanced Inefficiencies)
+    float[] tier_f_vals = array.new_float(), int[] tier_f_times = array.new_int() // Micro estructura (Order Blocks / Swings)
+
+    // 1. TIER S: Data Highs / Lows (Con mechas gigantes)
+    if not na(active_data) and not active_data.mitigated
+        if is_bull and active_data.is_high and active_data.lvl > price_baseline
+            array.push(tier_s_vals, active_data.lvl), array.push(tier_s_times, active_data.start_t)
+        else if not is_bull and not active_data.is_high and active_data.lvl < price_baseline
+            array.push(tier_s_vals, active_data.lvl), array.push(tier_s_times, active_data.start_t)
+
+    // 2. TIER B: Sesiones Previas (Asia, London), PDH/PDL, y Relative Equal Highs/Lows
+    if array.size(liqs) > 0
+        for item in liqs
+            if is_bull and item.is_bsl and item.lvl > price_baseline
+                array.push(tier_b_vals, item.lvl), array.push(tier_b_times, item.t_start)
+            else if not is_bull and not item.is_bsl and item.lvl < price_baseline
+                array.push(tier_b_vals, item.lvl), array.push(tier_b_times, item.t_start)
+
+    if array.size(reqh_list) > 0
+        for req_item in reqh_list
+            if is_bull and req_item.is_bsl and req_item.lvl > price_baseline
+                array.push(tier_b_vals, req_item.lvl), array.push(tier_b_times, time) 
+            else if not is_bull and not req_item.is_bsl and req_item.lvl < price_baseline
+                array.push(tier_b_vals, req_item.lvl), array.push(tier_b_times, time)
+
+    // 3. TIER C y TIER F: FVGs y Micro Estructura
+    for i = 1 to 150
+        if is_bull
+            // Tier C (FVGs Bajistas arriba del precio)
+            float fvg_bot = high[i], float fvg_top = low[i+2]
+            if fvg_bot < fvg_top and fvg_bot > price_baseline
+                bool is_mitigated = false
+                float partial_wick = fvg_bot 
+                for j = i - 1 to 1
+                    if high[j] >= fvg_top
+                        is_mitigated := true, break
+                    else if high[j] > partial_wick
+                        partial_wick := high[j]
+                if not is_mitigated
+                    array.push(tier_c_vals, partial_wick), array.push(tier_c_times, time[i])
+                    
+            // Tier F (Micro Swings para gestionar el riesgo)
+            if i >= 3
+                float sh = high[i]
+                if sh > high[i+1] and sh > high[i-1] and sh > price_baseline
+                    bool is_swept = false
+                    for j = i - 1 to 1 
+                        if high[j] >= sh
+                            is_swept := true, break 
+                    if not is_swept 
+                        array.push(tier_f_vals, sh), array.push(tier_f_times, time[i])
+
+        else
+            // Tier C (FVGs Alcistas debajo del precio)
+            float fvg_top = low[i], float fvg_bot = high[i+2]
+            if fvg_top > fvg_bot and fvg_top < price_baseline
+                bool is_mitigated = false
+                float partial_wick = fvg_top 
+                for j = i - 1 to 1
+                    if low[j] <= fvg_bot
+                        is_mitigated := true, break
+                    else if low[j] < partial_wick
+                        partial_wick := low[j]
+                if not is_mitigated
+                    array.push(tier_c_vals, partial_wick), array.push(tier_c_times, time[i])
+
+            // Tier F (Micro Swings para gestionar el riesgo)
+            if i >= 3
+                float sl = low[i]
+                if sl < low[i+1] and sl < low[i-1] and sl < price_baseline
+                    bool is_swept = false
+                    for j = i - 1 to 1 
+                        if low[j] <= sl
+                            is_swept := true, break 
+                    if not is_swept 
+                        array.push(tier_f_vals, sl), array.push(tier_f_times, time[i])
+
+ // --- SELECCIÓN INTELIGENTE DE TARGETS (ENFOQUE REALISTA Y ESCALONADO) ---
+    // 1. Juntamos TODOS los Tiers en una lista maestra
+    float[] all_vals = array.new_float()
+    int[] all_times = array.new_int()
+
+    if array.size(tier_s_vals) > 0
+        for i = 0 to array.size(tier_s_vals) - 1
+            array.push(all_vals, array.get(tier_s_vals, i)), array.push(all_times, array.get(tier_s_times, i))
+    
+    if array.size(tier_b_vals) > 0
+        for i = 0 to array.size(tier_b_vals) - 1
+            array.push(all_vals, array.get(tier_b_vals, i)), array.push(all_times, array.get(tier_b_times, i))
+
+    if array.size(tier_c_vals) > 0
+        for i = 0 to array.size(tier_c_vals) - 1
+            array.push(all_vals, array.get(tier_c_vals, i)), array.push(all_times, array.get(tier_c_times, i))
+
+    if array.size(tier_f_vals) > 0
+        for i = 0 to array.size(tier_f_vals) - 1
+            array.push(all_vals, array.get(tier_f_vals, i)), array.push(all_times, array.get(tier_f_times, i))
+
+    // 2. Ordenamos toda la estructura de más cercana a más lejana
+    int[] sorted_all = array.size(all_vals) > 0 ? array.sort_indices(all_vals, is_bull ? order.ascending : order.descending) : array.new_int()
+
+    float be_val  = na, int be_time  = 0
+    float tp1_val = na, int tp1_time = 0
+    float tp2_val = na, int tp2_time = 0
+    bool is_frontrun = false 
+
+    // 3. Asignación con Filtro de Separación (Evita TPs amontonados)
+    if array.size(sorted_all) > 0
+        float last_val = na
+        int target_idx = 0
+        
+        // La distancia mínima entre TPs es la mitad de la volatilidad actual (ATR)
+        float min_sep = current_atr * 0.5 
+
+        for i = 0 to array.size(sorted_all) - 1
+            int true_idx = array.get(sorted_all, i)
+            float v = array.get(all_vals, true_idx)
+            int t = array.get(all_times, true_idx)
+
+            // Solo acepta el nivel si es el primero, o si está lo suficientemente lejos del anterior
+            if na(last_val) or math.abs(v - last_val) > min_sep
+                if target_idx == 0
+                    be_val := v, be_time := t
+                else if target_idx == 1
+                    tp1_val := v, tp1_time := t
+                else if target_idx == 2
+                    tp2_val := v, tp2_time := t
+                    break // Ya tenemos los 3 niveles perfectos
+
+                last_val := v
+                target_idx += 1
+
+    // Si por alguna razón no encontró 3 niveles distintos, los clona para que el setup no falle
+    if na(tp1_val)
+        tp1_val := be_val, tp1_time := be_time
+    if na(tp2_val)
+        tp2_val := tp1_val, tp2_time := tp1_time
+
+    // 🌟 Filtro Front-Run Definitivo (Anti-Recálculo) 🌟
+    if not na(be_val)
+        if is_bull and high >= be_val 
+            is_frontrun := true
+        if not is_bull and low <= be_val 
+            is_frontrun := true
+
+    [be_val, tp1_val, tp2_val, be_time, tp1_time, tp2_time, is_frontrun]
+
+// =============================================================================
+// --- 6.5 MACRO DATA HIGHS & LOWS (8:30 AM) ---
+// =============================================================================
+var int last_data_t30 = na
+
+string data_line_style = data_style_in == "Solid" ? line.style_solid : data_style_in == "Dashed" ? line.style_dashed : line.style_dotted
+string data_lbl_size = data_lbl_sz == "Small" ? size.small : data_lbl_sz == "Normal" ? size.normal : data_lbl_sz == "Large" ? size.large : size.tiny
+
+// 1. Escáner Sub-temporal a 1 Minuto
+f_get_830_data() =>
+    var float h29 = na, var float l29 = na
+    var float h30 = na, var float l30 = na, var float o30 = na, var float c30 = na, var int t30 = na
+    var float h31 = na, var float l31 = na
+    var int last_day = na
+
+    int current_day = dayofmonth(time, "America/New_York")
+    if current_day != last_day
+        h29 := na, l29 := na
+        h30 := na, l30 := na, o30 := na, c30 := na, t30 := na
+        h31 := na, l31 := na
+        last_day := current_day
+
+    int h = hour(time, "America/New_York")
+    int m = minute(time, "America/New_York")
+
+    if h == 8 and m == 29
+        h29 := high, l29 := low
+    if h == 8 and m == 30
+        h30 := high, l30 := low, o30 := open, c30 := close, t30 := time
+    if h == 8 and m == 31
+        h31 := high, l31 := low
+
+    [h29, l29, h30, l30, o30, c30, t30, h31, l31]
+
+[h29, l29, h30, l30, o30, c30, t30, h31, l31] = request.security(syminfo.tickerid, "1", f_get_830_data(), lookahead=barmerge.lookahead_on)
+
+// 2. Validación y Creación del Nivel de Datos
+bool data_ready = not na(h31) and not na(h30) and not na(h29)
+
+if data_ready and show_data_in and (na(last_data_t30) or t30 != last_data_t30)
+    last_data_t30 := t30
+
+    bool is_swing_high = h30 > h29 and h30 > h31
+    bool is_swing_low  = l30 < l29 and l30 < l31
+
+    float upper_wick = h30 - math.max(o30, c30)
+    float lower_wick = math.min(o30, c30) - l30
+
+    bool valid_high = is_swing_high and (upper_wick >= data_pts)
+    bool valid_low  = is_swing_low and (lower_wick >= data_pts)
+
+    // Si ambos son válidos (vela doji expansiva), gana la mecha más grande
+    if valid_high and valid_low
+        if upper_wick >= lower_wick
+            valid_low := false
+        else
+            valid_high := false
+
+    if valid_high
+        line ln = line.new(t30, h30, time, h30, xloc=xloc.bar_time, color=c_data, style=data_line_style)
+        label lb = label.new(time, h30, "DATA.H", xloc=xloc.bar_time, color=color(na), textcolor=c_data_lbl, style=label.style_label_left, size=data_lbl_size)
+        active_data := DataEvent.new(h30, true, t30, ln, lb, false, 0)
+    else if valid_low
+        line ln = line.new(t30, l30, time, l30, xloc=xloc.bar_time, color=c_data, style=data_line_style)
+        label lb = label.new(time, l30, "DATA.L", xloc=xloc.bar_time, color=color(na), textcolor=c_data_lbl, style=label.style_label_left, size=data_lbl_size)
+        active_data := DataEvent.new(l30, false, t30, ln, lb, false, 0)
+
+// 3. Tracking y Mitigación Dinámica
+if not na(active_data) and not active_data.mitigated
+    bool mitigated = false
+    if active_data.is_high
+        if high >= active_data.lvl
+            mitigated := true
+    else
+        if low <= active_data.lvl
+            mitigated := true
+
+    if mitigated
+        active_data.mitigated := true
+        if data_del_mit
+            line.delete(active_data.ln)
+            label.delete(active_data.lbl)
+            active_data := na
+        else
+            // Congelamos la línea y centramos la etiqueta gloriosamente
+            line.set_x2(active_data.ln, time)
+            int center_t = int((active_data.start_t + time) / 2)
+            label.set_x(active_data.lbl, center_t)
+            float y_offset = data_offset * syminfo.mintick
+            label.set_y(active_data.lbl, active_data.is_high ? active_data.lvl + y_offset : active_data.lvl - y_offset)
+            label.set_style(active_data.lbl, active_data.is_high ? label.style_label_down : label.style_label_up)
+    else
+        // Seguimos empujando la línea mientras no sea mitigada
+        line.set_x2(active_data.ln, time + one_bar_ms * 3)
+        label.set_x(active_data.lbl, time + one_bar_ms * 3)
+        
+        active_data.bar_count += 1
+        if data_cleanup > 0 and active_data.bar_count >= data_cleanup
+            line.delete(active_data.ln)
+            label.delete(active_data.lbl)
+            active_data := na
+
+// =============================================================================
+// --- 7. MOTOR SMT PRO+ (STRICT PIVOT SYNC ENGINE) ---
+// =============================================================================
+
+// 1. Obtener datos del activo correlacionado
+[c_h, c_l, c_c] = request.security(target_sym, timeframe.period, [high, low, close], lookahead=barmerge.lookahead_on)
+
+// 2. Control de Sensibilidad
+int p_len = smt_sens == "Sensitive" ? 1 : smt_sens == "Normal" ? 4 : 6
+
+// 3. Extracción de Pivotes (Sin Tolerancia)
+float ph_main = ta.pivothigh(high, p_len, p_len)
+float pl_main = ta.pivotlow(low, p_len, p_len)
+
+float ph_corr = ta.pivothigh(c_h, p_len, p_len)
+float pl_corr = ta.pivotlow(c_l, p_len, p_len)
+
+// Sincronización Estricta: Tienen que nacer en la misma vela de confirmación
+bool sync_ph = not na(ph_main) and not na(ph_corr)
+bool sync_pl = not na(pl_main) and not na(pl_corr)
+
+// 4. Estructura de Memoria
+type SMT_Pro
+    int start_time
+    float main_lvl
+    float corr_lvl
+    bool is_bsl
+    bool is_active
+    bool is_parked
+    bool is_invalid
+    int extreme_time
+    float extreme_price
+    line ln
+    label lb
+
+var smt_list = array.new<SMT_Pro>()
+
+// 5. Agregar nuevos niveles sincronizados
+if sync_ph
+    array.push(smt_list, SMT_Pro.new(time[p_len], ph_main, ph_corr, true, false, false, false, 0, 0.0, line(na), label(na)))
+if sync_pl
+    array.push(smt_list, SMT_Pro.new(time[p_len], pl_main, pl_corr, false, false, false, false, 0, 0.0, line(na), label(na)))
+
+// 6. MOTOR DE EVALUACIÓN SMT
+bool valid_bear_smt = false
+bool valid_bull_smt = false
+
+if array.size(smt_list) > 0
+    for i = array.size(smt_list) - 1 to 0
+        smt = array.get(smt_list, i)
+        
+        if smt.is_invalid
+            continue
+            
+        // --- LÓGICA BEARISH SMT (Divergencia BSL) ---
+        if smt.is_bsl
+            bool main_sweeps = high > smt.main_lvl
+            bool corr_sweeps = c_h > smt.corr_lvl
+            
+            // Regla de Invalidación: Ambos barrieron la liquidez
+            if main_sweeps and corr_sweeps
+                smt.is_invalid := true
+                continue
+                
+            // Detección de Divergencia
+            if (main_sweeps and not corr_sweeps) or (corr_sweeps and not main_sweeps)
+                smt.is_active := true
+                
+                // Tracking de Extremo
+                if not smt.is_parked
+                    if smt.extreme_price == 0.0 or high > smt.extreme_price
+                        smt.extreme_price := high
+                        smt.extreme_time := time
+                        
+            // Confirmación (Parking): Nuevo pivote a favor
+            if smt.is_active and not smt.is_parked and not na(ph_main)
+                smt.is_parked := true
+                
+            // Invalidación Post-Parked: Quiebre estructural
+            if smt.is_parked and close > smt.extreme_price
+                smt.is_invalid := true
+                continue
+
+        // --- LÓGICA BULLISH SMT (Divergencia SSL) ---
+        else
+            bool main_sweeps = low < smt.main_lvl
+            bool corr_sweeps = c_l < smt.corr_lvl
+            
+            if main_sweeps and corr_sweeps
+                smt.is_invalid := true
+                continue
+                
+            if (main_sweeps and not corr_sweeps) or (corr_sweeps and not main_sweeps)
+                smt.is_active := true
+                
+                if not smt.is_parked
+                    if smt.extreme_price == 0.0 or low < smt.extreme_price
+                        smt.extreme_price := low
+                        smt.extreme_time := time
+                        
+            if smt.is_active and not smt.is_parked and not na(pl_main)
+                smt.is_parked := true
+                
+            if smt.is_parked and close < smt.extreme_price
+                smt.is_invalid := true
+                continue
+
+// 7. GARBAGE COLLECTOR & DEDUPLICACIÓN
+if array.size(smt_list) > 1
+    for i = array.size(smt_list) - 1 to 1
+        smt_A = array.get(smt_list, i)
+        if not smt_A.is_active or smt_A.is_invalid
+            continue
+        for j = i - 1 to 0
+            smt_B = array.get(smt_list, j)
+            if not smt_B.is_active or smt_B.is_invalid
+                continue
+            
+            // Si son del mismo tipo (Ambos Bullish o Ambos Bearish)
+            if smt_A.is_bsl == smt_B.is_bsl 
+                // 1. Deduplicación por misma mecha de término (Terminan exactamente igual)
+                if smt_A.extreme_time == smt_B.extreme_time
+                    if smt_A.is_bsl
+                        if smt_A.main_lvl > smt_B.main_lvl
+                            smt_B.is_invalid := true
+                        else
+                            smt_A.is_invalid := true
+                    else
+                        if smt_A.main_lvl < smt_B.main_lvl
+                            smt_B.is_invalid := true
+                        else
+                            smt_A.is_invalid := true
+                
+                // 2. 🌟 FILTRO ANTI-ANIDAMIENTO (SMT dentro de SMT) 🌟
+                else
+                    // Si A está completamente dentro de la duración de B
+                    if smt_A.start_time >= smt_B.start_time and smt_A.extreme_time <= smt_B.extreme_time
+                        smt_A.is_invalid := true
+                    
+                    // Si B está completamente dentro de la duración de A
+                    else if smt_B.start_time >= smt_A.start_time and smt_B.extreme_time <= smt_A.extreme_time
+                        smt_B.is_invalid := true
+
+// 8. RENDERIZADO VISUAL Y LIMPIEZA
+int visible_count = 0
+if array.size(smt_list) > 0
+    for i = array.size(smt_list) - 1 to 0
+        smt = array.get(smt_list, i)
+        
+        // Exportación para el Entry Engine
+        if smt.is_active and not smt.is_invalid
+            if smt.is_bsl
+                valid_bear_smt := true
+            else
+                valid_bull_smt := true
+        
+        // Borrar visuales si es inválido
+        if smt.is_invalid
+            if not na(smt.ln)
+                line.delete(smt.ln)
+                label.delete(smt.lb)
+            array.remove(smt_list, i)
+            continue
+            
+        // Renderizado
+        bool should_draw = smt.is_active and (smt_realtime or smt.is_parked)
+        
+        if should_draw and visible_count < smt_max_vis
+            visible_count += 1
+            
+            color smt_c  = smt.is_bsl ? c_smt_bear : c_smt_bull
+            int smt_w    = smt.is_bsl ? f_get_width(sz_bear_w) : f_get_width(sz_bull_w)
+            string smt_s = smt.is_bsl ? st_bear_s : st_bull_s
+            string s_lbl = smt.is_bsl ? "BSL " + lbl_text_base : "SSL " + lbl_text_base
+            string y_loc = smt.is_bsl ? label.style_label_down : label.style_label_up
+            
+            if na(smt.ln)
+                smt.ln := line.new(smt.start_time, smt.main_lvl, smt.extreme_time, smt.extreme_price, xloc=xloc.bar_time, color=smt_c, width=smt_w, style=f_get_style(smt_s))
+                if smt_show_lbl
+                    smt.lb := label.new(smt.extreme_time, smt.extreme_price, s_lbl, xloc=xloc.bar_time, color=color(na), textcolor=c_smt_lbl, style=y_loc, size=f_get_size(smt_lbl_sz))
+            else
+                line.set_xy1(smt.ln, smt.start_time, smt.main_lvl)
+                line.set_xy2(smt.ln, smt.extreme_time, smt.extreme_price)
+                if smt_show_lbl
+                    label.set_xy(smt.lb, smt.extreme_time, smt.extreme_price)
+        else
+            // Si supera el límite o no debe dibujarse, ocultar visuales pero mantener memoria
+            if not na(smt.ln)
+                line.delete(smt.ln)
+                label.delete(smt.lb)
+                smt.ln := line(na)
+                smt.lb := label(na)
+
+// GC Failsafe
+while array.size(smt_list) > 50
+    smt = array.shift(smt_list)
+    if not na(smt.ln)
+        line.delete(smt.ln)
+        label.delete(smt.lb)
+
+// =============================================================================
+// --- FILTRO DE KILLZONE ---
+// =============================================================================
+// Conectado al Master Time (t_nyam, t_lunch, etc.) y forzando hora NY
+bool check_am   = not na(time(timeframe.period, t_nyam, "America/New_York"))
+bool check_nyl  = not na(time(timeframe.period, t_lunch, "America/New_York"))
+bool check_pm   = not na(time(timeframe.period, t_nypm, "America/New_York"))
+bool check_lon  = not na(time(timeframe.period, t_lon, "America/New_York"))
+bool check_asia = not na(time(timeframe.period, t_asia, "America/New_York"))
+
+// Verificamos si estamos en la hora y si el usuario tiene prendido el botón de operarla
+bool valid_am   = use_ny_am and check_am
+bool valid_nyl  = trade_nyl and check_nyl
+bool valid_pm   = use_ny_pm and check_pm
+bool valid_lon  = use_lon and check_lon
+bool valid_asia = use_asia and check_asia
+
+// Si alguna de las sesiones válidas está activa, estamos en Killzone
+bool in_killzone = valid_am or valid_nyl or valid_pm or valid_lon or valid_asia
+
+// Si el filtro estricto está prendido y NO estamos en killzone, se penaliza el setup
+if use_kz and not in_killzone
+    t_grade := "C"
+
+// =============================================================================
+// --- 8. MOTOR RTD+ (ENTRY SNIPER & WICK TRACKER) ---
+// =============================================================================
+var float global_sl = na
+var float global_tp = na
+var float global_be = na
+var float global_entry = na
+
+// =============================================================================
+// --- 🌟 MOTOR INSTITUCIONAL: HTF FVG TRACKER (5m, 15m, 1H) CON MEMORIA 🌟 ---
+// =============================================================================
+f_htf_fvg_tracker() =>
+    var float b_top = na, var float b_bot = na
+    var float br_top = na, var float br_bot = na
+    
+    if low > high[2]
+        b_top := low, b_bot := high[2]
+    if close < b_bot
+        b_top := na, b_bot := na
+        
+    if high < low[2]
+        br_top := low[2], br_bot := high
+    if close > br_top
+        br_top := na, br_bot := na
+        
+    [b_top, b_bot, br_top, br_bot]
+
+// NOMBRES CORREGIDOS (Con el prefijo fvg_ para no chocar con el SMT)
+[fvg_bt5, fvg_bb5, fvg_brt5, fvg_brb5] = request.security(syminfo.tickerid, "5", f_htf_fvg_tracker())
+[fvg_bt15, fvg_bb15, fvg_brt15, fvg_brb15] = request.security(syminfo.tickerid, "15", f_htf_fvg_tracker())
+[fvg_bt60, fvg_bb60, fvg_brt60, fvg_brb60] = request.security(syminfo.tickerid, "60", f_htf_fvg_tracker())
+
+// NUEVO: Extraemos el FVG de la temporalidad actual (LTF) en tiempo real
+[fvg_bt_curr, fvg_bb_curr, fvg_brt_curr, fvg_brb_curr] = f_htf_fvg_tracker()
+
+// 🌟 FIX: Ahora el Current TF también puede activar el Delivery si el usuario encendió la opción
+bool touch_bull_pda = (low <= fvg_bt5 and high >= fvg_bb5) or (low <= fvg_bt15 and high >= fvg_bb15) or (low <= fvg_bt60 and high >= fvg_bb60) or (include_curr_tf and low <= fvg_bt_curr and high >= fvg_bb_curr)
+
+bool touch_bear_pda = (high >= fvg_brb5 and low <= fvg_brt5) or (high >= fvg_brb15 and low <= fvg_brt15) or (high >= fvg_brb60 and low <= fvg_brt60) or (include_curr_tf and high >= fvg_brb_curr and low <= fvg_brt_curr)
+
+var int last_bull_pda_time = 0
+var int last_bear_pda_time = 0
+
+if touch_bull_pda
+    last_bull_pda_time := time
+if touch_bear_pda
+    last_bear_pda_time := time
+
+int pda_memory_ms = 1500000 // 25 min de Ventana de Gracia
+bool valid_bull_pda_delivery = (time - last_bull_pda_time) <= pda_memory_ms
+bool valid_bear_pda_delivery = (time - last_bear_pda_time) <= pda_memory_ms
+bool htf_pda_delivered = valid_bull_pda_delivery or valid_bear_pda_delivery
+
+// =============================================================================
+
+type TrapFVG
+    float top
+    float bot
+    bool  is_bull
+    int   t_start
+    int   b_index
+    float extreme
+    int   extreme_time
+
+var traps = array.new<TrapFVG>()
+
+float fvg_gap_bull = low - high[2]
+float fvg_gap_bear = low[2] - high
+
+float min_gap = 0.0
+if sens_mode == "Strict"
+    min_gap := global_atr * 0.25 
+else if sens_mode == "Sensitive"
+    min_gap := global_atr * 0.025              
+else
+    min_gap := global_atr * 0.1 
+
+if fvg_gap_bull > min_gap
+    float ext_val_h = math.max(high, high[1], high[2])
+    int ext_time_h = ext_val_h == high ? time : ext_val_h == high[1] ? time[1] : time[2]
+    
+    bool merged = false
+    if detect_mode == "Single" and array.size(traps) > 0
+        last_trap = array.get(traps, array.size(traps) - 1)
+        
+        // 🌟 FIX FINAL: Si nacen EXACTAMENTE uno después del otro (== 1), se fusionan siempre.
+        // Quitamos la regla de precio para permitir "Measuring Gaps" consecutivos.
+        if last_trap.is_bull and (bar_index - last_trap.b_index) == 1
+            last_trap.top := math.max(last_trap.top, low)
+            last_trap.bot := math.min(last_trap.bot, high[2])
+            last_trap.b_index := bar_index 
+            if ext_val_h > last_trap.extreme
+                last_trap.extreme := ext_val_h
+                last_trap.extreme_time := ext_time_h
+            merged := true
+    if not merged
+        array.push(traps, TrapFVG.new(low, high[2], true, time[2], bar_index, ext_val_h, ext_time_h))
+
+if fvg_gap_bear > min_gap
+    float ext_val_l = math.min(low, low[1], low[2])
+    int ext_time_l = ext_val_l == low ? time : ext_val_l == low[1] ? time[1] : time[2]
+    
+    bool merged = false
+    if detect_mode == "Single" and array.size(traps) > 0
+        last_trap = array.get(traps, array.size(traps) - 1)
+        
+        // 🌟 FIX FINAL: Si nacen EXACTAMENTE uno después del otro (== 1), se fusionan siempre.
+        if not last_trap.is_bull and (bar_index - last_trap.b_index) == 1
+            last_trap.top := math.max(last_trap.top, low[2])
+            last_trap.bot := math.min(last_trap.bot, high)
+            last_trap.b_index := bar_index 
+            if ext_val_l < last_trap.extreme
+                last_trap.extreme := ext_val_l
+                last_trap.extreme_time := ext_time_l
+            merged := true
+    if not merged
+        array.push(traps, TrapFVG.new(low[2], high, false, time[2], bar_index, ext_val_l, ext_time_l))
+if array.size(traps) > 50
+    array.shift(traps)
+
+int proj_time_box  = time 
+
+if array.size(traps) > 0
+    for i = array.size(traps) - 1 to 0
+        tr = array.get(traps, i)
+        
+        // TRACKING DINÁMICO DE LA MECHA EXTREMA
+        if tr.is_bull
+            if high > tr.extreme
+                tr.extreme := high
+                tr.extreme_time := time
+        else
+            if low < tr.extreme
+                tr.extreme := low
+                tr.extreme_time := time
+        
+        int max_ifvg_candles = allow_15_ifvg ? 15 : 6
+        if (bar_index - tr.b_index) > max_ifvg_candles
+            array.remove(traps, i)
+            continue
+            
+        bool trap_broken = false
+        
+       // --- VALIDACIÓN DE CONTEXTO ESTRICTA ---
+        bool recent_bsl_sweep = bear_context and (time - last_bsl_sweep_time) <= ms_limit
+        if recent_bsl_sweep and math.abs(tr.extreme_time - last_bsl_sweep_time) > (timeframe.multiplier * 60000 * 5) 
+            recent_bsl_sweep := false
+        bool is_valid_bear_ctx = (req_pda_vip and valid_bear_pda_delivery) or recent_bsl_sweep or valid_bear_smt or not req_sweep
+        
+        bool recent_ssl_sweep = bull_context and (time - last_ssl_sweep_time) <= ms_limit
+        if recent_ssl_sweep and math.abs(tr.extreme_time - last_ssl_sweep_time) > (timeframe.multiplier * 60000 * 5) 
+            recent_ssl_sweep := false
+        bool is_valid_bull_ctx = (req_pda_vip and valid_bull_pda_delivery) or recent_ssl_sweep or valid_bull_smt or not req_sweep
+        
+        // --- SETUP BEARISH (Venta) ---
+        if tr.is_bull and close < tr.bot
+            trap_broken := true 
+            if show_bear and is_valid_bear_ctx
+                [g_str, g_val, good_pd, strong_mom] = f_get_grade(false, close, open, global_eq, global_atr)
+                [has_targets, target_str] = f_check_dol(false, close, global_atr)
+                
+                // LÓGICA DE STOP LOSS AJUSTABLE PARA BEARISH
+                float final_sl_price = 0.0
+                int sl_anchor_time = time
+                
+                if sl_mode == "Wick / Swing"
+                    final_sl_price := tr.extreme // 0 Buffer
+                    sl_anchor_time := tr.extreme_time // Nace exactamente en la mecha extrema (pasado)
+                else if sl_mode == "iFVG Border"
+                    final_sl_price := tr.top + sl_buffer // Sí usa buffer
+                    sl_anchor_time := time // Nace en la vela actual (para no manchar)
+                else
+                    final_sl_price := close + sl_fixed_pts
+                    sl_anchor_time := time // Nace en la vela actual (para no manchar)
+                    
+                float sl_dist_pts = math.abs(final_sl_price - close)
+                
+                float risk_amt = acc_bal * (risk_pct / 100)
+                float contract_qty = 0.0
+                if sl_dist_pts > 0 and syminfo.pointvalue > 0
+                    contract_qty := math.floor(risk_amt / (sl_dist_pts * syminfo.pointvalue))
+                
+                string qty_str = ""
+                if show_qty and contract_qty > 0
+                    qty_str := " | " + str.tostring(contract_qty, "#") + " C"
+
+                if g_val >= req_g_val
+                    t_grade   := g_str
+                    t_liq     := recent_bsl_sweep
+                    t_pd      := good_pd
+                    t_mom     := strong_mom
+                    t_ifvg    := true
+                    t_smt     := valid_bear_smt 
+                    t_targets := has_targets
+
+                    string hover_text = "--- CONFLUENCES ---\n" + "Grade: " + g_str + "\n" + (valid_bear_pda_delivery ? "✅ HTF PDA Delivery\n" : "❌ HTF PDA Delivery\n") + (recent_bsl_sweep ? "✅ Liquidity Sweep\n" : "➖ No Sweep (Optional)\n") + "✅ iFVG\n" + (good_pd ? "✅ Premium/Discount\n" : "❌ Premium/Discount\n") + (strong_mom ? "✅ Momentum\n" : "❌ Momentum\n") + (valid_bear_smt ? "✅ SMT\n" : "❌ SMT\n") + (has_targets ? "✅ DOL (" + target_str + ")" : "❌ DOL") + "\n\n" + "--- RISK ---" + "\n💰 Contracts: " + str.tostring(contract_qty, "#") + "\n🛑 SL Dist: " + str.tostring(sl_dist_pts, "#.##") + " pts"
+
+                   // 1. EL MOTOR CALCULA EL BE Y EVALÚA EL FRONT-RUN
+                    [be_val, tp1_val, tp2_val, be_t, t1_t, t2_t, is_frontrun] = f_get_exec_plan(false, close, req_be_safe, use_frontrun_filter, global_atr)
+
+                    // 2. FILTRO ANTI FRONT-RUN (¿La mecha tocó el BE o la vela fue gigante?)
+                    bool be_already_hit = not na(be_val) and low <= be_val
+                    bool is_invalid = be_already_hit or is_frontrun
+
+                    // 3. INDICADOR DE PRE-SEÑAL LIMPIO
+                    bool is_closed = barstate.isconfirmed
+                    color current_box_c = is_closed ? c_bear_box : color.new(color.gray, 80)
+                    color current_lin_c = is_closed ? c_bear_entry : color.gray
+                    string current_text = (is_closed ? "RTD- [" : "⏳ PRE [") + g_str + "]" + qty_str
+
+                    // 4. SOLO DIBUJA Y REGISTRA SI EL TRADE ESTÁ FRESCO Y NO FUE ARRUINADO POR VELA GIGANTE
+                    if not is_invalid
+                        box b = box.new(tr.t_start, tr.top, proj_time_box, tr.bot, xloc=xloc.bar_time, border_color=color(na), bgcolor=current_box_c)
+                        line l = line.new(time, close, time + one_bar_ms * 8, close, xloc=xloc.bar_time, color=current_lin_c, style=is_closed ? line.style_solid : line.style_dashed, width=2)
+                        label lb = label.new(time + one_bar_ms * 8, close, current_text, xloc=xloc.bar_time, color=color(na), textcolor=current_lin_c, style=label.style_label_left, size=size.small, tooltip=show_hover ? hover_text : na)
+
+                        VisualPlan new_viz = VisualPlan.new(line(na), line(na), line(na), line(na), label(na), label(na), label(na), label(na), false, false, false, be_val, tp1_val, tp2_val)
+                        
+                        global_sl := final_sl_price
+                        global_tp := tp1_val
+                        global_be := be_val
+                        global_entry := close
+
+                        if viz_active
+                            int init_right_x = time + one_bar_ms * 8
+                            
+                            // 🌟 MAGIA VISUAL: Detectamos si el BE y el TP1 son exactamente la misma línea
+                            bool is_merged = not na(be_val) and not na(tp1_val) and be_val == tp1_val
+                            
+                            string sl_txt = "SL" + (show_prices ? " (" + str.tostring(final_sl_price, format.mintick) + ")" : "")
+                            string be_txt = "BE" + (show_prices and not na(be_val) ? " (" + str.tostring(be_val, format.mintick) + ")" : "")
+                            // Si están fusionados, cambiamos el texto del TP1 a "TP1 / BE"
+                            string tp1_txt = (is_merged ? "TP1 / BE" : "TP1") + (show_prices and not na(tp1_val) ? " (" + str.tostring(tp1_val, format.mintick) + ")" : "")
+                            string tp2_txt = "TP2" + (show_prices and not na(tp2_val) ? " (" + str.tostring(tp2_val, format.mintick) + ")" : "")
+
+                            new_viz.l_sl := line.new(sl_anchor_time, final_sl_price, init_right_x, final_sl_price, xloc=xloc.bar_time, color=c_viz_sl, style=line.style_solid, width=1)
+                            new_viz.lb_sl := label.new(init_right_x, final_sl_price, sl_txt, xloc=xloc.bar_time, color=color(na), textcolor=c_viz_sl, style=label.style_label_left, size=size.small)
+
+                            // 🌟 Solo dibujamos el "BE" suelto si NO está fusionado con el TP1
+                            if not na(be_val) and not is_merged
+                                new_viz.l_be := line.new(be_t, be_val, init_right_x, be_val, xloc=xloc.bar_time, color=c_viz_be, style=line.style_dotted, width=1)
+                                new_viz.lb_be := label.new(init_right_x, be_val, be_txt, xloc=xloc.bar_time, color=color(na), textcolor=c_viz_be, style=label.style_label_left, size=size.small)
+                            
+                            if not na(tp1_val)
+                                new_viz.l_tp1 := line.new(t1_t, tp1_val, init_right_x, tp1_val, xloc=xloc.bar_time, color=c_viz_tp, style=line.style_dotted, width=1)
+                                new_viz.lb_tp1 := label.new(init_right_x, tp1_val, tp1_txt, xloc=xloc.bar_time, color=color(na), textcolor=c_viz_tp, style=label.style_label_left, size=size.small)
+                            
+                            if not na(tp2_val)
+                                new_viz.l_tp2 := line.new(t2_t, tp2_val, init_right_x, tp2_val, xloc=xloc.bar_time, color=c_viz_tp, style=line.style_dotted, width=1)
+                                new_viz.lb_tp2 := label.new(init_right_x, tp2_val, tp2_txt, xloc=xloc.bar_time, color=color(na), textcolor=c_viz_tp, style=label.style_label_left, size=size.small)
+
+                        array.push(active_setups, ActiveSetup.new(b, l, lb, final_sl_price, false, time, tr.top, tr.bot, g_str, recent_bsl_sweep, good_pd, strong_mom, valid_bear_smt, has_targets, target_str, contract_qty, sl_dist_pts, true, new_viz))
+                bear_context := false
+
+        // --- SETUP BULLISH (Compra) ---
+        else if not tr.is_bull and close > tr.top
+            trap_broken := true 
+            if show_bull and is_valid_bull_ctx
+                [g_str, g_val, good_pd, strong_mom] = f_get_grade(true, close, open, global_eq, global_atr)
+                [has_targets, target_str] = f_check_dol(true, close, global_atr)
+                
+                // LÓGICA DE STOP LOSS AJUSTABLE PARA BULLISH
+                float final_sl_price = 0.0
+                int sl_anchor_time = time
+                
+                if sl_mode == "Wick / Swing"
+                    final_sl_price := tr.extreme // 0 Buffer
+                    sl_anchor_time := tr.extreme_time // Nace exactamente en la mecha extrema (pasado)
+                else if sl_mode == "iFVG Border"
+                    final_sl_price := tr.bot - sl_buffer // Sí usa buffer
+                    sl_anchor_time := time // Nace en la vela actual (para no manchar)
+                else
+                    final_sl_price := close - sl_fixed_pts
+                    sl_anchor_time := time // Nace en la vela actual (para no manchar)
+                    
+                float sl_dist_pts = math.abs(close - final_sl_price)
+                
+                float risk_amt = acc_bal * (risk_pct / 100)
+                float contract_qty = 0.0
+                if sl_dist_pts > 0 and syminfo.pointvalue > 0
+                    contract_qty := math.floor(risk_amt / (sl_dist_pts * syminfo.pointvalue))
+                
+                string qty_str = ""
+                if show_qty and contract_qty > 0
+                    qty_str := " | " + str.tostring(contract_qty, "#") + " C"
+
+                if g_val >= req_g_val
+                    t_grade   := g_str
+                    t_liq     := recent_ssl_sweep
+                    t_pd      := good_pd
+                    t_mom     := strong_mom
+                    t_ifvg    := true
+                    t_smt     := valid_bull_smt 
+                    t_targets := has_targets
+
+                    string hover_text = "--- CONFLUENCES ---\n" + "Grade: " + g_str + "\n" + (valid_bull_pda_delivery ? "✅ HTF PDA Delivery\n" : "❌ HTF PDA Delivery\n") + (recent_ssl_sweep ? "✅ Liquidity Sweep\n" : "➖ No Sweep (Optional)\n") + "✅ iFVG\n" + (good_pd ? "✅ Premium/Discount\n" : "❌ Premium/Discount\n") + (strong_mom ? "✅ Momentum\n" : "❌ Momentum\n") + (valid_bull_smt ? "✅ SMT\n" : "❌ SMT\n") + (has_targets ? "✅ DOL (" + target_str + ")" : "❌ DOL") + "\n\n" + "--- RISK ---" + "\n💰 Contracts: " + str.tostring(contract_qty, "#") + "\n🛑 SL Dist: " + str.tostring(sl_dist_pts, "#.##") + " pts"
+
+                    /// 1. EL MOTOR CALCULA EL BE Y EVALÚA EL FRONT-RUN (Con "true" para Compras)
+                    [be_val, tp1_val, tp2_val, be_t, t1_t, t2_t, is_frontrun] = f_get_exec_plan(true, close, req_be_safe, use_frontrun_filter, global_atr)
+
+                    // 2. FILTRO ANTI FRONT-RUN (En compras medimos si el 'high' tocó el BE arriba)
+                    bool be_already_hit = not na(be_val) and high >= be_val
+                    bool is_invalid = be_already_hit or (use_frontrun_filter and is_frontrun)
+
+                    // 3. INDICADOR DE PRE-SEÑAL LIMPIO
+                    bool is_closed = barstate.isconfirmed
+                    color current_box_c = is_closed ? c_bull_box : color.new(color.gray, 80)
+                    color current_lin_c = is_closed ? c_bull_entry : color.gray
+                    string current_text = (is_closed ? "RTD+ [" : "⏳ PRE [") + g_str + "]" + qty_str
+
+                    // 4. SOLO DIBUJA Y REGISTRA SI EL TRADE ESTÁ FRESCO Y NO FUE ARRUINADO POR VELA GIGANTE
+                    if not is_invalid
+                        box b = box.new(tr.t_start, tr.top, proj_time_box, tr.bot, xloc=xloc.bar_time, border_color=color(na), bgcolor=current_box_c)
+                        line l = line.new(time, close, time + one_bar_ms * 8, close, xloc=xloc.bar_time, color=current_lin_c, style=is_closed ? line.style_solid : line.style_dashed, width=2)
+                        label lb = label.new(time + one_bar_ms * 8, close, current_text, xloc=xloc.bar_time, color=color(na), textcolor=current_lin_c, style=label.style_label_left, size=size.small, tooltip=show_hover ? hover_text : na)
+
+                        VisualPlan new_viz = VisualPlan.new(line(na), line(na), line(na), line(na), label(na), label(na), label(na), label(na), false, false, false, be_val, tp1_val, tp2_val)
+                        
+                        global_sl := final_sl_price
+                        global_tp := tp1_val
+                        global_be := be_val
+                        global_entry := close
+
+                        if viz_active
+                            int init_right_x = time + one_bar_ms * 8
+                            
+                            // 🌟 MAGIA VISUAL: Detectamos si el BE y el TP1 son exactamente la misma línea
+                            bool is_merged = not na(be_val) and not na(tp1_val) and be_val == tp1_val
+                            
+                            string sl_txt = "SL" + (show_prices ? " (" + str.tostring(final_sl_price, format.mintick) + ")" : "")
+                            string be_txt = "BE" + (show_prices and not na(be_val) ? " (" + str.tostring(be_val, format.mintick) + ")" : "")
+                            
+                            // 🌟 Si están fusionados, cambiamos el texto del TP1 a "TP1 / BE"
+                            string tp1_txt = (is_merged ? "TP1 / BE" : "TP1") + (show_prices and not na(tp1_val) ? " (" + str.tostring(tp1_val, format.mintick) + ")" : "")
+                            string tp2_txt = "TP2" + (show_prices and not na(tp2_val) ? " (" + str.tostring(tp2_val, format.mintick) + ")" : "")
+
+                            new_viz.l_sl := line.new(sl_anchor_time, final_sl_price, init_right_x, final_sl_price, xloc=xloc.bar_time, color=c_viz_sl, style=line.style_dotted, width=1)
+                            new_viz.lb_sl := label.new(init_right_x, final_sl_price, sl_txt, xloc=xloc.bar_time, color=color(na), textcolor=c_viz_sl, style=label.style_label_left, size=size.small)
+
+                            // 🌟 Solo dibujamos el "BE" suelto si NO está fusionado con el TP1
+                            if not na(be_val) and not is_merged
+                                new_viz.l_be := line.new(be_t, be_val, init_right_x, be_val, xloc=xloc.bar_time, color=c_viz_be, style=line.style_dotted, width=1)
+                                new_viz.lb_be := label.new(init_right_x, be_val, be_txt, xloc=xloc.bar_time, color=color(na), textcolor=c_viz_be, style=label.style_label_left, size=size.small)
+                            
+                            if not na(tp1_val)
+                                new_viz.l_tp1 := line.new(t1_t, tp1_val, init_right_x, tp1_val, xloc=xloc.bar_time, color=c_viz_tp, style=line.style_dotted, width=1)
+                                new_viz.lb_tp1 := label.new(init_right_x, tp1_val, tp1_txt, xloc=xloc.bar_time, color=color(na), textcolor=c_viz_tp, style=label.style_label_left, size=size.small)
+                            
+                            if not na(tp2_val)
+                                new_viz.l_tp2 := line.new(t2_t, tp2_val, init_right_x, tp2_val, xloc=xloc.bar_time, color=c_viz_tp, style=line.style_dotted, width=1)
+                                new_viz.lb_tp2 := label.new(init_right_x, tp2_val, tp2_txt, xloc=xloc.bar_time, color=color(na), textcolor=c_viz_tp, style=label.style_label_left, size=size.small)
+
+                        array.push(active_setups, ActiveSetup.new(b, l, lb, final_sl_price, true, time, tr.top, tr.bot, g_str, recent_ssl_sweep, good_pd, strong_mom, valid_bull_smt, has_targets, target_str, contract_qty, sl_dist_pts, true, new_viz))
+                bull_context := false
+
+        if trap_broken
+            array.remove(traps, i)
+
+
+// =============================================================================
+// --- 9. GHOST BUSTER: LIMPIEZA Y TRACKING DINÁMICO DE SETUPS ---
+// =============================================================================
+
+// --- 1. VARIABLES DEL PANEL ---
+var int count_aplus = 0, var int w_aplus = 0, var int be_aplus = 0, var int l_aplus = 0
+var int count_a     = 0, var int w_a     = 0, var int be_a     = 0, var int l_a     = 0
+var int count_b     = 0, var int w_b     = 0, var int be_b     = 0, var int l_b     = 0
+
+// 2. Lo inyectamos en el cerebro global (jerarquía de sesiones)
+string current_sess = in_am ? "NY AM" : in_nyl ? "NY LUNCH" : in_pm ? "NY PM" : in_lon ? "LONDON" : in_asia ? "ASIA" : "CLOSE"
+
+// Pine Script detecta automáticamente cuando el texto de la sesión cambia
+bool is_new_sess = current_sess != current_sess[1]
+
+// Botón nuevo en el menú para controlar esta limpieza
+bool reset_sess  = input.bool(true, "Reset Stats on Session Change", group="SESSION STATS PANEL")
+bool reset_daily = input.bool(true, "Reset Stats Every Day (Turn OFF for Backtesting)", group="SESSION STATS PANEL")
+
+// Lógica inteligente de limpieza (Solo borra los números, NO los trades del gráfico)
+bool do_reset = (is_new_day and reset_daily) or (is_new_sess and reset_sess and current_sess != "CLOSE")
+
+if do_reset
+    count_aplus := 0, w_aplus := 0, be_aplus := 0, l_aplus := 0
+    count_a := 0, w_a := 0, be_a := 0, l_a := 0
+    count_b := 0, w_b := 0, be_b := 0, l_b := 0
+
+// Limpieza profunda de los gráficos (Esta sí ocurre solo al cambiar de día)
+if is_new_day 
+    if array.size(active_setups) > 0
+        for i = array.size(active_setups) - 1 to 0
+            s_del = array.get(active_setups, i)
+            box.delete(s_del.bx)
+            line.delete(s_del.ln)
+            label.delete(s_del.lb)
+            if viz_active
+                if not na(s_del.viz.l_sl)
+                    line.delete(s_del.viz.l_sl)
+                    label.delete(s_del.viz.lb_sl)
+                if not na(s_del.viz.l_be)
+                    line.delete(s_del.viz.l_be)
+                    label.delete(s_del.viz.lb_be)
+                if not na(s_del.viz.l_tp1)
+                    line.delete(s_del.viz.l_tp1)
+                    label.delete(s_del.viz.lb_tp1)
+                if not na(s_del.viz.l_tp2)
+                    line.delete(s_del.viz.l_tp2)
+                    label.delete(s_del.viz.lb_tp2)
+        array.clear(active_setups) // Vaciamos todo el historial del día anterior
+
+// (A partir de aquí dejas tu "if array.size(active_setups) > 0" intacto hacia abajo...)
+
+if array.size(active_setups) > 0
+    for i = array.size(active_setups) - 1 to 0
+        s = array.get(active_setups, i)
+        
+        if not s.is_active
+            continue
+
+        // 1. DETECCIÓN INSTANTÁNEA DE MUERTE (SL ORIGINAL O BREAK-EVEN STOP)
+        bool hit_sl = false
+        bool hit_be_stop = false
+        
+        // --- FIX VELA 0 ---
+        bool is_creation_bar = (line.get_x1(s.ln) == time) or (line.get_x1(s.ln) == bar_index)
+        
+        if not is_creation_bar
+            if not s.viz.be_hit
+                if s.is_bull and low <= s.invalid_level
+                    hit_sl := true
+                else if not s.is_bull and high >= s.invalid_level
+                    hit_sl := true
+            else
+                float entry_p = line.get_y1(s.ln)
+                if s.is_bull and low <= entry_p
+                    hit_be_stop := true
+                else if not s.is_bull and high >= entry_p
+                    hit_be_stop := true
+                
+        // --- CASO A: Toca el Stop Loss Original (Trade Perdido) ---
+        if hit_sl
+            // === SUMAMOS LA PÉRDIDA AL PANEL ===
+            if s.g_str == "A+"
+                l_aplus += 1
+            else if s.g_str == "A"
+                l_a += 1
+            else
+                l_b += 1
+            
+            s.is_active := false 
+            if viz_active
+                if not na(s.viz.l_tp1)
+                    line.delete(s.viz.l_tp1)
+                    label.delete(s.viz.lb_tp1)
+                if not na(s.viz.l_tp2)
+                    line.delete(s.viz.l_tp2)
+                    label.delete(s.viz.lb_tp2)
+                if not na(s.viz.l_be)
+                    line.delete(s.viz.l_be)
+                    label.delete(s.viz.lb_be)
+                if not na(s.viz.l_sl)
+                    line.set_x2(s.viz.l_sl, time)
+                    label.set_x(s.viz.lb_sl, time)
+                    
+            if rm_losing
+                box.delete(s.bx)
+                line.delete(s.ln)
+                label.delete(s.lb)
+                if viz_active and not na(s.viz.l_sl)
+                    line.delete(s.viz.l_sl)
+                    label.delete(s.viz.lb_sl)
+                array.remove(active_setups, i)
+            else
+                label.set_text(s.lb, "❌ LOSS")
+                label.set_textcolor(s.lb, c_viz_sl)
+                line.set_color(s.ln, c_viz_sl)
+            continue
+            
+        // --- CASO B: Toca Break-Even y se devuelve a la entrada (Scratch Trade) ---
+        if hit_be_stop
+            // === SUMAMOS EL BREAK EVEN AL PANEL ===
+            if s.g_str == "A+"
+                be_aplus += 1
+            else if s.g_str == "A"
+                be_a += 1
+            else
+                be_b += 1
+            
+            s.is_active := false
+            if rm_losing
+                box.delete(s.bx)
+                line.delete(s.ln)
+                label.delete(s.lb)
+                if viz_active
+                    if not na(s.viz.l_sl)
+                        line.delete(s.viz.l_sl)
+                        label.delete(s.viz.lb_sl)
+                    if not na(s.viz.l_be)
+                        line.delete(s.viz.l_be)
+                        label.delete(s.viz.lb_be)
+                    if not na(s.viz.l_tp1)
+                        line.delete(s.viz.l_tp1)
+                        label.delete(s.viz.lb_tp1)
+                    if not na(s.viz.l_tp2)
+                        line.delete(s.viz.l_tp2)
+                        label.delete(s.viz.lb_tp2)
+                array.remove(active_setups, i)
+                continue
+            else
+                if viz_active
+                    if not na(s.viz.l_tp1)
+                        line.delete(s.viz.l_tp1)
+                        label.delete(s.viz.lb_tp1)
+                    if not na(s.viz.l_tp2)
+                        line.delete(s.viz.l_tp2)
+                        label.delete(s.viz.lb_tp2)
+                
+                label.set_text(s.lb, "⚪ BE")
+                label.set_textcolor(s.lb, color.gray)
+                line.set_color(s.ln, color.gray)
+                continue 
+
+        // --- 2. TRACKING Y GESTIÓN DE TARGETS (Independiente de lo visual) ---
+        int current_right_x = time + one_bar_ms * 8
+        
+        // Tracking de Break-Even Target
+        if not na(s.viz.p_be) and not s.viz.be_hit
+            bool hit = s.is_bull ? high >= s.viz.p_be : low <= s.viz.p_be
+            if hit
+                s.viz.be_hit := true
+                if not na(s.viz.l_be)
+                    line.set_x2(s.viz.l_be, time)
+                    label.set_x(s.viz.lb_be, time)
+                if not na(s.viz.l_sl)
+                    line.delete(s.viz.l_sl)
+                    label.delete(s.viz.lb_sl)
+            else
+                if not na(s.viz.l_be)
+                    line.set_x2(s.viz.l_be, current_right_x)
+                    label.set_x(s.viz.lb_be, current_right_x)
+                if not na(s.viz.l_sl)
+                    line.set_x2(s.viz.l_sl, current_right_x)
+                    label.set_x(s.viz.lb_sl, current_right_x)
+
+        // Tracking TP1 
+        if not na(s.viz.p_tp1) and not s.viz.tp1_hit
+            bool hit = s.is_bull ? high >= s.viz.p_tp1 : low <= s.viz.p_tp1
+            if hit
+                s.viz.tp1_hit := true
+                if not na(s.viz.l_tp1)
+                    line.set_x2(s.viz.l_tp1, time)
+                    label.set_x(s.viz.lb_tp1, time)
+                
+                // --- CERRAR COMO WIN SI NO HAY TP2 ---
+                if na(s.viz.p_tp2)
+                    if s.g_str == "A+"
+                        w_aplus += 1
+                    else if s.g_str == "A"
+                        w_a += 1
+                    else
+                        w_b += 1
+                        
+                    s.is_active := false
+                    if show_winning
+                        label.set_text(s.lb, "✅ WIN [" + s.g_str + "]")
+                        label.set_textcolor(s.lb, color.lime)
+                    else
+                        box.delete(s.bx)
+                        line.delete(s.ln)
+                        label.delete(s.lb)
+                        if not na(s.viz.l_sl)
+                            line.delete(s.viz.l_sl)
+                            label.delete(s.viz.lb_sl)
+                        if not na(s.viz.l_be)
+                            line.delete(s.viz.l_be)
+                            label.delete(s.viz.lb_be)
+                        if not na(s.viz.l_tp1)
+                            line.delete(s.viz.l_tp1)
+                            label.delete(s.viz.lb_tp1)
+                        if not na(s.viz.l_tp2)
+                            line.delete(s.viz.l_tp2)
+                            label.delete(s.viz.lb_tp2)
+                    array.remove(active_setups, i)
+                    continue 
+            else
+                if not na(s.viz.l_tp1)
+                    line.set_x2(s.viz.l_tp1, current_right_x)
+                    label.set_x(s.viz.lb_tp1, current_right_x)
+
+        // Tracking TP2
+        if not na(s.viz.p_tp2) and not s.viz.tp2_hit
+            bool hit = s.is_bull ? high >= s.viz.p_tp2 : low <= s.viz.p_tp2
+            if hit
+                s.viz.tp2_hit := true
+                if not na(s.viz.l_tp2)
+                    line.set_x2(s.viz.l_tp2, time)
+                    label.set_x(s.viz.lb_tp2, time)
+                
+                // --- CERRAR COMO WIN AL TOCAR TP FINAL ---
+                if s.g_str == "A+"
+                    w_aplus += 1
+                else if s.g_str == "A"
+                    w_a += 1
+                else
+                    w_b += 1
+                    
+                s.is_active := false
+                if show_winning
+                    label.set_text(s.lb, "✅ WIN [" + s.g_str + "]")
+                    label.set_textcolor(s.lb, color.lime)
+                else
+                    box.delete(s.bx)
+                    line.delete(s.ln)
+                    label.delete(s.lb)
+                    if not na(s.viz.l_sl)
+                        line.delete(s.viz.l_sl)
+                        label.delete(s.viz.lb_sl)
+                    if not na(s.viz.l_be)
+                        line.delete(s.viz.l_be)
+                        label.delete(s.viz.lb_be)
+                    if not na(s.viz.l_tp1)
+                        line.delete(s.viz.l_tp1)
+                        label.delete(s.viz.lb_tp1)
+                    if not na(s.viz.l_tp2)
+                        line.delete(s.viz.l_tp2)
+                        label.delete(s.viz.lb_tp2)
+                    array.remove(active_setups, i)
+                    continue 
+            else
+                if not na(s.viz.l_tp2)
+                    line.set_x2(s.viz.l_tp2, current_right_x)
+                    label.set_x(s.viz.lb_tp2, current_right_x)
+
+    // --- Límite inteligente de setups en pantalla ---
+    int count_active = 0
+    if array.size(active_setups) > 0
+        for i = 0 to array.size(active_setups) - 1
+            if array.get(active_setups, i).is_active
+                count_active += 1
+
+    while count_active > max_show
+        for i = 0 to array.size(active_setups) - 1
+            oldest_s = array.get(active_setups, i)
+            if oldest_s.is_active
+                box.delete(oldest_s.bx)
+                line.delete(oldest_s.ln)
+                label.delete(oldest_s.lb)
+                if viz_active
+                    if not na(oldest_s.viz.l_sl)
+                        line.delete(oldest_s.viz.l_sl)
+                        label.delete(oldest_s.viz.lb_sl)
+                    if not na(oldest_s.viz.l_be)
+                        line.delete(oldest_s.viz.l_be)
+                        label.delete(oldest_s.viz.lb_be)
+                    if not na(oldest_s.viz.l_tp1)
+                        line.delete(oldest_s.viz.l_tp1)
+                        label.delete(oldest_s.viz.lb_tp1)
+                    if not na(oldest_s.viz.l_tp2)
+                        line.delete(oldest_s.viz.l_tp2)
+                        label.delete(oldest_s.viz.lb_tp2)
+                array.remove(active_setups, i)
+                count_active -= 1
+                break
+
+// =============================================================================
+// --- 10. DIBUJAR DASHBOARD (DINÁMICO CON OPCIONES DE MENÚ) ---
+// =============================================================================
+
+string sym_ok   = "✅" 
+string sym_no   = "❌" 
+
+// Tabla unificada (usamos los colores e inputs dinámicos del menú)
+var table dash = table.new(pos_str, 2, 12, border_width=1, border_color=c_border, frame_color=c_border, frame_width=1, bgcolor=c_bg_soft)
+
+if show_dash and barstate.islast
+    
+    // --- LÓGICA DEL PANEL INTELIGENTE ---
+    bool is_trade_active = false
+    bool disp_ifvg = false
+    bool disp_liq = false
+    bool disp_mom = false
+    bool disp_htf_pda = false
+    bool disp_pd = false
+    bool disp_targets = false
+    bool disp_smt = false
+    string disp_grade = "Waiting..."
+    string clean_qty = "-"
+
+    if array.size(active_setups) > 0
+        for i = 0 to array.size(active_setups) - 1
+            s = array.get(active_setups, i)
+            if s.is_active
+                is_trade_active := true
+                disp_ifvg    := true
+                disp_liq     := s.t_liq
+                disp_mom     := s.t_mom
+                disp_htf_pda := true 
+                disp_pd      := s.t_pd
+                disp_targets := s.t_targets
+                disp_smt     := s.t_smt
+                disp_grade   := s.g_str
+                clean_qty    := str.tostring(s.contract_qty, "#") + " C"
+                break
+                
+    if not is_trade_active
+        bool live_bull_liq = bull_context and (time - last_ssl_sweep_time) <= ms_limit
+        bool live_bear_liq = bear_context and (time - last_bsl_sweep_time) <= ms_limit
+        
+        if active_bias == "Bullish"
+            disp_liq := live_bull_liq
+            disp_smt := valid_bull_smt
+        else if active_bias == "Bearish"
+            disp_liq := live_bear_liq
+            disp_smt := valid_bear_smt
+        else
+            disp_liq := live_bull_liq or live_bear_liq
+            disp_smt := valid_bull_smt or valid_bear_smt
+            
+        disp_htf_pda := htf_pda_delivered 
+        disp_ifvg    := false 
+        disp_mom     := false 
+        disp_pd      := false 
+        disp_targets := false 
+        disp_grade   := "- -"
+
+    // ==========================================
+    // DIBUJO DINÁMICO DE LA TABLA
+    // ==========================================
+    // Limpiamos la tabla en cada tick por si apagaste alguna opción en el menú
+    table.clear(dash, 0, 0, 1, 11)
+
+    int row = 0 // Contador inteligente de filas
+
+    // Fila 0: Encabezado 
+    table.cell(dash, 0, row, "Checklist", text_color=c_text_harm, text_size=dash_txt_sz, bgcolor=c_bg_head, text_halign=text.align_left)
+    table.cell(dash, 1, row, "Status", text_color=c_text_harm, text_size=dash_txt_sz, bgcolor=c_bg_head, text_halign=text.align_right)
+    row += 1
+    
+    // Checklist Dinámico
+    if show_chk_bias
+        table.cell(dash, 0, row, "HTF Bias", text_color=c_text_harm, text_size=dash_txt_sz, text_halign=text.align_left)
+        color bias_c = active_bias == "Bullish" ? #2962ff : active_bias == "Bearish" ? #F23645 : color.gray
+        table.cell(dash, 1, row, active_bias, text_color=bias_c, text_size=dash_txt_sz, text_halign=text.align_right)
+        row += 1
+
+    if show_chk_sweep
+        table.cell(dash, 0, row, "Liq Sweep", text_color=c_text_harm, text_size=dash_txt_sz, text_halign=text.align_left)
+        table.cell(dash, 1, row, disp_liq ? sym_ok : sym_no, text_size=dash_txt_sz, text_halign=text.align_right)
+        row += 1
+
+    if show_chk_ifvg
+        table.cell(dash, 0, row, "iFVG", text_color=c_text_harm, text_size=dash_txt_sz, text_halign=text.align_left)
+        table.cell(dash, 1, row, disp_ifvg ? sym_ok : sym_no, text_size=dash_txt_sz, text_halign=text.align_right)
+        row += 1
+
+    if show_chk_mom
+        table.cell(dash, 0, row, "Momentum", text_color=c_text_harm, text_size=dash_txt_sz, text_halign=text.align_left)
+        table.cell(dash, 1, row, disp_mom ? sym_ok : sym_no, text_size=dash_txt_sz, text_halign=text.align_right)
+        row += 1
+
+    if show_chk_pda
+        table.cell(dash, 0, row, "HTF PDA Delivery", text_color=c_text_harm, text_size=dash_txt_sz, text_halign=text.align_left)
+        table.cell(dash, 1, row, disp_htf_pda ? sym_ok : sym_no, text_size=dash_txt_sz, text_halign=text.align_right)
+        row += 1
+
+    if show_chk_pd
+        table.cell(dash, 0, row, "Premium/Discount", text_color=c_text_harm, text_size=dash_txt_sz, text_halign=text.align_left)
+        table.cell(dash, 1, row, disp_pd ? sym_ok : sym_no, text_size=dash_txt_sz, text_halign=text.align_right)
+        row += 1
+
+    if show_chk_dol
+        table.cell(dash, 0, row, "DOL", text_color=c_text_harm, text_size=dash_txt_sz, text_halign=text.align_left)
+        table.cell(dash, 1, row, disp_targets ? sym_ok : sym_no, text_size=dash_txt_sz, text_halign=text.align_right)
+        row += 1
+
+    if show_chk_smt
+        table.cell(dash, 0, row, "SMT", text_color=c_text_harm, text_size=dash_txt_sz, text_halign=text.align_left)
+        table.cell(dash, 1, row, disp_smt ? sym_ok : sym_no, text_size=dash_txt_sz, text_halign=text.align_right)
+        row += 1
+
+    if show_chk_grade
+        table.cell(dash, 0, row, "Setup Grade", text_color=c_text_harm, text_size=dash_txt_sz, bgcolor=c_bg_head, text_halign=text.align_left)
+        color grade_color = color.gray
+        if disp_grade == "A+" or disp_grade == "A"
+            grade_color := color.lime
+        else if disp_grade == "A-" or disp_grade == "B+"
+            grade_color := color.rgb(255, 153, 0)
+        else if disp_grade == "B" or disp_grade == "C"
+            grade_color := color.red
+        table.cell(dash, 1, row, "[ " + disp_grade + " ]", text_color=grade_color, text_size=dash_txt_sz, bgcolor=c_bg_head, text_halign=text.align_right)
+        row += 1
+
+    if show_chk_qty
+        table.cell(dash, 0, row, "Position Size", text_color=c_text_harm, text_size=dash_txt_sz, bgcolor=c_bg_head, text_halign=text.align_left)
+        table.cell(dash, 1, row, str.trim(clean_qty), text_color=color.new(#ffd700, 0), text_size=dash_txt_sz, bgcolor=c_bg_head, text_halign=text.align_right)
+
+// =============================================================================
+// --- 11. DIBUJO DEL PANEL DE ESTADÍSTICAS (DINÁMICO Y "SOFT GLASS") ---
+// =============================================================================
+
+// Sumamos al contador TOTAL de setups al instante en que se crea una nueva señal
+if t_ifvg and not t_ifvg[1]
+    if t_grade == "A+"
+        count_aplus += 1
+    else if t_grade == "A"
+        count_a += 1
+    else if t_grade == "B" or t_grade == "B+"
+        count_b += 1
+
+// --- DIBUJO DE LA TABLA (Armonizada y Dinámica) ---
+var table stats_tb = table.new(stats_pos_real, 5, 4, border_width=1, border_color=c_border, frame_color=c_border, frame_width=1, bgcolor=c_bg_soft)
+
+color sess_col = in_am or in_pm ? color.new(#ffd700, 0) : in_lon ? color.new(#2962ff, 0) : in_asia ? color.new(#9c27b0, 0) : color.new(#a0a0a0, 0)
+color win_col  = color.new(#4caf50, 0) 
+color be_col   = color.new(#ff9800, 0) 
+color loss_col = color.new(#f44336, 0) 
+
+if show_stats and barstate.islast
+    // Limpiamos la tabla en cada tick por si apagaste alguna opción en el menú
+    table.clear(stats_tb, 0, 0, 4, 3)
+    
+    int s_row = 0 // Contador inteligente de filas
+    
+    // Fila 0: Encabezados 
+    table.cell(stats_tb, 0, s_row, current_sess, text_color=sess_col, text_size=stats_txt_sz, bgcolor=c_bg_head)
+    table.cell(stats_tb, 1, s_row, "Tot", text_color=c_text_harm, text_size=stats_txt_sz, bgcolor=c_bg_head)
+    table.cell(stats_tb, 2, s_row, "W", text_color=c_text_harm, text_size=stats_txt_sz, bgcolor=c_bg_head)
+    table.cell(stats_tb, 3, s_row, "BE", text_color=c_text_harm, text_size=stats_txt_sz, bgcolor=c_bg_head)
+    table.cell(stats_tb, 4, s_row, "L", text_color=c_text_harm, text_size=stats_txt_sz, bgcolor=c_bg_head)
+    s_row += 1
+    
+    // Fila A+ Dinámica
+    if show_stat_aplus
+        table.cell(stats_tb, 0, s_row, "Grade A+", text_color=c_text_harm, text_size=stats_txt_sz)
+        table.cell(stats_tb, 1, s_row, str.tostring(count_aplus), text_color=c_text_harm, text_size=stats_txt_sz)
+        table.cell(stats_tb, 2, s_row, str.tostring(w_aplus), text_color=win_col, text_size=stats_txt_sz)
+        table.cell(stats_tb, 3, s_row, str.tostring(be_aplus), text_color=be_col, text_size=stats_txt_sz)
+        table.cell(stats_tb, 4, s_row, str.tostring(l_aplus), text_color=loss_col, text_size=stats_txt_sz)
+        s_row += 1
+    
+    // Fila A Dinámica
+    if show_stat_a
+        table.cell(stats_tb, 0, s_row, "Grade A", text_color=c_text_harm, text_size=stats_txt_sz)
+        table.cell(stats_tb, 1, s_row, str.tostring(count_a), text_color=c_text_harm, text_size=stats_txt_sz)
+        table.cell(stats_tb, 2, s_row, str.tostring(w_a), text_color=win_col, text_size=stats_txt_sz)
+        table.cell(stats_tb, 3, s_row, str.tostring(be_a), text_color=be_col, text_size=stats_txt_sz)
+        table.cell(stats_tb, 4, s_row, str.tostring(l_a), text_color=loss_col, text_size=stats_txt_sz)
+        s_row += 1
+    
+    // Fila B Dinámica
+    if show_stat_b
+        table.cell(stats_tb, 0, s_row, "Grade B", text_color=c_text_harm, text_size=stats_txt_sz)
+        table.cell(stats_tb, 1, s_row, str.tostring(count_b), text_color=c_text_harm, text_size=stats_txt_sz)
+        table.cell(stats_tb, 2, s_row, str.tostring(w_b), text_color=win_col, text_size=stats_txt_sz)
+        table.cell(stats_tb, 3, s_row, str.tostring(be_b), text_color=be_col, text_size=stats_txt_sz)
+        table.cell(stats_tb, 4, s_row, str.tostring(l_b), text_color=loss_col, text_size=stats_txt_sz)
+        s_row += 1
